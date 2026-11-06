@@ -1,0 +1,50 @@
+# Gaze
+
+A small camera app for the Linux desktop, built with GTK 4, libadwaita and
+GStreamer and written in Rust. It follows the [Omarchy](https://omarchy.org/)
+theme live, like Rustle and Bubo.
+
+Gaze shows a camera the way Chromium (and so Meet, Teams and Zoom) shows it:
+cameras are opened directly with V4L2, frames go straight to GTK, and colour
+conversion honours the stream's colour range. Snapshot 51 decodes the
+limited-range video of the Surface Pro 12's hardware-ISP cameras as full
+range, which makes everything look grey and flat; Gaze does not.
+
+## Features
+
+- Viewfinder at the camera's own frame rate, mirrored for front cameras
+  (toggle with Ctrl+M).
+- Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
+- Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
+  encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Colour statistics (Ctrl+I): black and white level, mean level, saturation,
+  and the colour of a region you drag on the picture. Handy for judging a
+  camera's tuning without guessing from a screenshot.
+- Remembers the camera you picked and the mirror setting
+  (`~/.config/gaze/settings`).
+
+## Building and installing
+
+```sh
+cargo run            # from a checkout
+sh install.sh        # ~/.local; PREFIX=/usr for system-wide (with sudo)
+sh uninstall.sh
+```
+
+Needs GTK ≥ 4.18, libadwaita ≥ 1.8 and GStreamer with: `gtk4paintablesink`
+(gst-plugin-gtk4), `v4l2src`, `mp4mux`, `pulsesrc` (gst-plugins-good),
+`vah264enc` (gst-plugin-va), `avenc_aac` (gst-libav). `install.sh` checks for
+all of them and prints the install command for what is missing.
+
+`GAZE_LOG=debug` turns logging up.
+
+## Theme
+
+With Omarchy installed, Gaze reads `~/.local/state/omarchy/current/theme/colors.toml`
+and maps it onto libadwaita's colours, following `omarchy theme set` as it
+happens. A theme can ship its own `gaze.css` to replace the derived styles.
+The palette code is a port of Rustle's (`rustle-core/src/omarchy.rs`).
+
+## Licence
+
+GPL-3.0-or-later.
