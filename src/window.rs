@@ -1,7 +1,8 @@
-//! The main window: viewfinder, shutter, camera picker and the colour
-//! statistics card.
+//! The main window: viewfinder, shutter, camera picker, the colour
+//! statistics card and the code scanner's card.
 
 use crate::camera::{self, Camera, CameraInfo, Event, LatestFrame, Tap, TapId};
+use crate::codes::{self, Code, Payload, Scanner};
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
 use adw::prelude::*;
@@ -23,11 +24,16 @@ struct Ui {
     stack: gtk::Stack,
     status: adw::StatusPage,
     picture: gtk::Picture,
-    /// Drawn over the picture: the measured region, later code outlines.
+    /// Drawn over the picture: the measured region and code outlines.
     overlay: gtk::DrawingArea,
     countdown: gtk::Label,
     timer_label: gtk::Label,
     stats_card: gtk::Box,
+    code_card: gtk::Box,
+    code_title: gtk::Label,
+    code_format: gtk::Label,
+    code_text: gtk::Label,
+    code_primary: gtk::Button,
     stats_labels: Vec<gtk::Label>,
     swatch: gtk::DrawingArea,
     cameras_dropdown: gtk::DropDown,
@@ -53,6 +59,15 @@ pub struct Window {
     /// A countdown in progress: its ticking source and the seconds left.
     countdown: RefCell<Option<glib::SourceId>>,
     countdown_left: Cell<u32>,
+    /// Code scanning: whether it is on, the scanner on the open camera, the
+    /// codes in the last frame (for the outlines) and the one on the card.
+    scan_on: Cell<bool>,
+    scanner: RefCell<Option<Scanner>>,
+    code_sender: async_channel::Sender<Vec<Code>>,
+    codes: RefCell<Vec<Code>>,
+    shown_code: RefCell<Option<(Code, Payload)>>,
+    /// A dismissed code's text: not shown again until it leaves the frame.
+    dismissed_code: RefCell<Option<String>>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -67,6 +82,9 @@ impl Window {
     pub fn new(app: &adw::Application) -> Rc<Self> {
         let settings = Settings::load();
         let ui = build_ui(app);
+        // The scanner's worker thread sends each scan here; only the newest
+        // unread one is kept.
+        let (code_sender, code_receiver) = async_channel::bounded::<Vec<Code>>(1);
         let this = Rc::new(Self {
             ui,
             mirror: Cell::new(settings.mirror),
@@ -76,6 +94,12 @@ impl Window {
             timer_secs: Cell::new(settings.timer),
             countdown: RefCell::new(None),
             countdown_left: Cell::new(0),
+            scan_on: Cell::new(false),
+            scanner: RefCell::new(None),
+            code_sender,
+            codes: RefCell::new(Vec::new()),
+            shown_code: RefCell::new(None),
+            dismissed_code: RefCell::new(None),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -88,6 +112,15 @@ impl Window {
         });
         this.connect();
         this.install_actions(app);
+        glib::spawn_future_local(glib::clone!(
+            #[weak]
+            this,
+            async move {
+                while let Ok(codes) = code_receiver.recv().await {
+                    this.on_codes(codes);
+                }
+            }
+        ));
         this.refresh_cameras();
         this.apply_mirror();
         this.apply_timer();
@@ -183,11 +216,37 @@ impl Window {
             #[weak(rename_to = this)]
             self,
             move |_, cr, _, _| {
+                let Some((vx, vy, vw, vh)) = this.video_rect() else {
+                    return;
+                };
+                let mirrored = this.mirror.get();
+                // Code outlines, in the accent colour. Bounds are in frame
+                // coordinates; the picture may be mirrored.
+                let codes = this.codes.borrow();
+                if !codes.is_empty() {
+                    let accent = adw::StyleManager::default().accent_color_rgba();
+                    for code in codes.iter() {
+                        let (x, y, w, h) = code.bounds;
+                        let x = if mirrored { 1.0 - x - w } else { x };
+                        rounded_rect(cr, vx + x * vw, vy + y * vh, w * vw, h * vh, 10.0);
+                        cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+                        cr.set_line_width(6.0);
+                        let _ = cr.stroke_preserve();
+                        cr.set_source_rgba(
+                            accent.red() as f64,
+                            accent.green() as f64,
+                            accent.blue() as f64,
+                            1.0,
+                        );
+                        cr.set_line_width(3.0);
+                        let _ = cr.stroke();
+                    }
+                }
+                drop(codes);
                 if !this.stats_on.get() {
                     return;
                 }
-                let (Some(r), Some((vx, vy, vw, vh))) = (this.region.get(), this.video_rect())
-                else {
+                let Some(r) = this.region.get() else {
                     return;
                 };
                 cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
@@ -196,6 +255,11 @@ impl Window {
                 cr.rectangle(vx + r.x * vw, vy + r.y * vh, r.w * vw, r.h * vh);
                 let _ = cr.stroke();
             }
+        ));
+        ui.code_primary.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.code_action()
         ));
         ui.swatch.set_draw_func(glib::clone!(
             #[weak(rename_to = this)]
@@ -294,6 +358,41 @@ impl Window {
         ));
         window.add_action(&stats);
         app.set_accels_for_action("win.stats", &["<Control>i"]);
+
+        let scan = gio::SimpleAction::new_stateful("scan", None, &false.to_variant());
+        scan.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let on = !this.scan_on.get();
+                this.scan_on.set(on);
+                action.set_state(&on.to_variant());
+                if !on {
+                    this.codes.borrow_mut().clear();
+                    this.ui.overlay.queue_draw();
+                    this.close_code();
+                }
+                this.sync_scanner();
+            }
+        ));
+        window.add_action(&scan);
+        app.set_accels_for_action("win.scan", &["<Control>s"]);
+
+        let close_code = gio::SimpleAction::new("close-code", None);
+        close_code.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.close_code()
+        ));
+        window.add_action(&close_code);
+
+        let copy_code = gio::SimpleAction::new("copy-code", None);
+        copy_code.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.copy_code()
+        ));
+        window.add_action(&copy_code);
 
         // Self-timer: a radio over the lengths in TIMERS, as seconds in a
         // string so a menu can target it.
@@ -444,8 +543,10 @@ impl Window {
                 log::info!("opened {}", info.name);
                 self.ui.picture.set_paintable(Some(&paintable));
                 self.stats_tap.set(None);
+                self.scanner.replace(None);
                 self.camera.replace(Some(camera));
                 self.sync_stats_tap();
+                self.sync_scanner();
                 self.ui.stack.set_visible_child_name("viewfinder");
                 self.update_shutter();
             }
@@ -472,6 +573,177 @@ impl Window {
             }
         }
         self.ui.overlay.queue_draw();
+    }
+
+    /// Scan the open camera exactly while scanning is on.
+    fn sync_scanner(&self) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            self.scanner.replace(None);
+            return;
+        };
+        let running = self.scanner.borrow().is_some();
+        match (self.scan_on.get(), running) {
+            (true, false) => {
+                let scanner = Scanner::start(camera, self.code_sender.clone());
+                self.scanner.replace(Some(scanner));
+            }
+            (false, true) => {
+                if let Some(scanner) = self.scanner.take() {
+                    scanner.stop(camera);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A scan came back: outline the codes and put a new one on the card.
+    fn on_codes(&self, codes: Vec<Code>) {
+        if !self.scan_on.get() {
+            return;
+        }
+        // A dismissed code comes back once it has been out of view.
+        let still_there = |text: &str| codes.iter().any(|c| c.text == text);
+        if self
+            .dismissed_code
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| !still_there(d))
+        {
+            self.dismissed_code.replace(None);
+        }
+        let new = codes
+            .iter()
+            .find(|c| {
+                let shown = self.shown_code.borrow();
+                let dismissed = self.dismissed_code.borrow();
+                shown.as_ref().is_none_or(|(s, _)| s.text != c.text)
+                    && dismissed.as_deref() != Some(c.text.as_str())
+            })
+            .cloned();
+        self.codes.replace(codes);
+        self.ui.overlay.queue_draw();
+        if let Some(code) = new {
+            self.show_code(code);
+        }
+    }
+
+    fn show_code(&self, code: Code) {
+        let payload = codes::classify(&code.text);
+        let ui = &self.ui;
+        let (title, action, text) = match &payload {
+            Payload::Link(uri) => ("Link", Some("Open"), uri.clone()),
+            Payload::Wifi(wifi) => (
+                "Wi-Fi Network",
+                Some("Join"),
+                match &wifi.password {
+                    Some(p) => format!("{}\nPassword: {p}", wifi.ssid),
+                    None => format!("{} (open network)", wifi.ssid),
+                },
+            ),
+            Payload::Contact => ("Contact", Some("Save Contact"), summarize_vcard(&code.text)),
+            Payload::Event => ("Event", Some("Save Event"), summarize_ical(&code.text)),
+            Payload::Text => ("Text", None, code.text.clone()),
+        };
+        ui.code_title.set_label(title);
+        ui.code_format.set_label(&code.format);
+        ui.code_text.set_label(&text);
+        ui.code_primary.set_visible(action.is_some());
+        ui.code_primary.set_label(action.unwrap_or(""));
+        ui.code_card.set_visible(true);
+        self.shown_code.replace(Some((code, payload)));
+    }
+
+    fn close_code(&self) {
+        self.ui.code_card.set_visible(false);
+        if let Some((code, _)) = self.shown_code.take() {
+            self.dismissed_code.replace(Some(code.text));
+        }
+    }
+
+    /// Copy the code's text (a Wi-Fi code's password) to the clipboard.
+    fn copy_code(&self) {
+        let shown = self.shown_code.borrow();
+        let Some((code, payload)) = shown.as_ref() else {
+            return;
+        };
+        let text = match payload {
+            Payload::Wifi(wifi) => wifi.password.clone().unwrap_or_else(|| wifi.ssid.clone()),
+            _ => code.text.clone(),
+        };
+        self.ui.window.clipboard().set_text(&text);
+        self.ui.toasts.add_toast(adw::Toast::new("Copied"));
+    }
+
+    /// The card's main button: open, join, or save.
+    fn code_action(self: &Rc<Self>) {
+        let shown = self.shown_code.borrow().clone();
+        let Some((code, payload)) = shown else {
+            return;
+        };
+        match payload {
+            Payload::Link(uri) => {
+                if let Err(error) =
+                    gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
+                {
+                    self.ui
+                        .toasts
+                        .add_toast(adw::Toast::new(&format!("Could not open: {error}")));
+                }
+            }
+            Payload::Wifi(wifi) => self.join_wifi(wifi),
+            Payload::Contact => self.save_payload(&code.text, "vcf", "Contact"),
+            Payload::Event => self.save_payload(&code.text, "ics", "Event"),
+            Payload::Text => {}
+        }
+    }
+
+    /// Connect to the network with NetworkManager, rescanning first so a
+    /// network it has not seen yet is found.
+    fn join_wifi(self: &Rc<Self>, wifi: codes::Wifi) {
+        let mut argv = vec![
+            "nmcli".to_string(),
+            "device".into(),
+            "wifi".into(),
+            "connect".into(),
+            wifi.ssid.clone(),
+        ];
+        if let Some(password) = &wifi.password {
+            argv.push("password".into());
+            argv.push(password.clone());
+        }
+        if wifi.hidden {
+            argv.push("hidden".into());
+            argv.push("yes".into());
+        }
+        self.ui
+            .toasts
+            .add_toast(adw::Toast::new(&format!("Joining {}…", wifi.ssid)));
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let _ = run(&["nmcli", "device", "wifi", "rescan"]).await;
+            glib::timeout_future(Duration::from_secs(2)).await;
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let message = match run(&argv).await {
+                Ok(_) => format!("Joined {}", wifi.ssid),
+                Err(error) => format!("Could not join {}: {error}", wifi.ssid),
+            };
+            this.ui.toasts.add_toast(adw::Toast::new(&message));
+        });
+    }
+
+    /// Write the payload to the downloads folder and offer to open it.
+    fn save_payload(&self, text: &str, extension: &str, what: &str) {
+        let dir = special_dir(glib::UserDirectory::Downloads, "Downloads");
+        let path = dir.join(format!("Gaze {what} {}.{extension}", timestamp()));
+        let result = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, text));
+        match result {
+            Ok(()) => self.toast_file(&format!("{what} saved"), path),
+            Err(error) => self
+                .ui
+                .toasts
+                .add_toast(adw::Toast::new(&format!("Could not save: {error}"))),
+        }
     }
 
     /// Tap the open camera for the stats card exactly when it is shown.
@@ -825,6 +1097,7 @@ fn build_ui(app: &adw::Application) -> Ui {
     let menu = gio::Menu::new();
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
+    view.append(Some("Scan Codes"), Some("win.scan"));
     view.append(Some("Colour Statistics"), Some("win.stats"));
     menu.append_section(None, &view);
     let files = gio::Menu::new();
@@ -911,6 +1184,72 @@ fn build_ui(app: &adw::Application) -> Ui {
     stats_card.append(&stats_title);
     stats_card.append(&grid);
 
+    // Code card: what the scanner found and what to do with it.
+    let code_title = gtk::Label::builder()
+        .label("Link")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    code_title.add_css_class("heading");
+    let code_format = gtk::Label::builder().label("QR Code").xalign(0.0).build();
+    code_format.add_css_class("dim-label");
+    code_format.add_css_class("caption");
+    let code_close = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .action_name("win.close-code")
+        .tooltip_text("Dismiss")
+        .valign(gtk::Align::Start)
+        .build();
+    code_close.add_css_class("flat");
+    code_close.add_css_class("circular");
+    let code_titles = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .build();
+    code_titles.append(&code_title);
+    code_titles.append(&code_format);
+    let code_header = gtk::Box::builder().spacing(8).build();
+    code_header.append(&code_titles);
+    code_header.append(&code_close);
+    let code_text = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .max_width_chars(44)
+        .lines(5)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .selectable(true)
+        .build();
+    code_text.add_css_class("payload");
+    let code_primary = gtk::Button::builder().label("Open").build();
+    code_primary.add_css_class("suggested-action");
+    code_primary.add_css_class("pill");
+    let code_copy = gtk::Button::builder()
+        .label("Copy")
+        .action_name("win.copy-code")
+        .build();
+    code_copy.add_css_class("pill");
+    let code_buttons = gtk::Box::builder()
+        .spacing(8)
+        .halign(gtk::Align::Start)
+        .build();
+    code_buttons.append(&code_primary);
+    code_buttons.append(&code_copy);
+    let code_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_top(12)
+        .margin_start(12)
+        .visible(false)
+        .build();
+    code_card.add_css_class("osd");
+    code_card.add_css_class("code");
+    code_card.append(&code_header);
+    code_card.append(&code_text);
+    code_card.append(&code_buttons);
+
     // Controls
     let mode_toggle = adw::ToggleGroup::new();
     mode_toggle.add(
@@ -988,11 +1327,21 @@ fn build_ui(app: &adw::Application) -> Ui {
     left.append(&timer_button);
     controls.set_start_widget(Some(&left));
     controls.set_center_widget(Some(&shutter));
+    let scan_button = gtk::ToggleButton::builder()
+        .icon_name("scanner-symbolic")
+        .action_name("win.scan")
+        .tooltip_text("Scan Codes")
+        .valign(gtk::Align::Center)
+        .build();
+    scan_button.add_css_class("osd");
+    scan_button.add_css_class("circular");
     let right = gtk::Box::builder()
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
+        .spacing(10)
         .build();
     right.append(&timer);
+    right.append(&scan_button);
     controls.set_end_widget(Some(&right));
 
     let overlay = gtk::Overlay::builder().child(&picture).build();
@@ -1001,6 +1350,7 @@ fn build_ui(app: &adw::Application) -> Ui {
     overlay.add_overlay(&countdown);
     overlay.add_overlay(&flash);
     overlay.add_overlay(&stats_card);
+    overlay.add_overlay(&code_card);
     overlay.add_overlay(&controls);
 
     let status = adw::StatusPage::builder()
@@ -1034,6 +1384,11 @@ fn build_ui(app: &adw::Application) -> Ui {
         countdown,
         timer_label,
         stats_card,
+        code_card,
+        code_title,
+        code_format,
+        code_text,
+        code_primary,
         stats_labels,
         swatch,
         cameras_dropdown,
@@ -1054,6 +1409,75 @@ pub fn photos_dir() -> PathBuf {
 
 pub fn videos_dir() -> PathBuf {
     special_dir(glib::UserDirectory::Videos, "Videos").join("Camera")
+}
+
+/// Run a command to completion; its stderr is the error.
+async fn run(argv: &[&str]) -> Result<(), String> {
+    let process = gio::Subprocess::newv(
+        &argv
+            .iter()
+            .map(|a| a.as_ref())
+            .collect::<Vec<&std::ffi::OsStr>>(),
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_PIPE,
+    )
+    .map_err(|e| e.to_string())?;
+    let (_, stderr) = process
+        .communicate_utf8_future(None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if process.is_successful() {
+        Ok(())
+    } else {
+        let stderr = stderr.map(|s| s.to_string()).unwrap_or_default();
+        Err(stderr.trim().lines().last().unwrap_or("failed").to_string())
+    }
+}
+
+fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    use std::f64::consts::PI;
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -PI / 2.0, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, PI / 2.0);
+    cr.arc(x + r, y + h - r, r, PI / 2.0, PI);
+    cr.arc(x + r, y + r, r, PI, 3.0 * PI / 2.0);
+    cr.close_path();
+}
+
+/// The name and a line or two of a vCard, for the card.
+fn summarize_vcard(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let (key, value) = line.split_once(':').unwrap_or((line, ""));
+        let key = key.split(';').next().unwrap_or("").to_ascii_uppercase();
+        match key.as_str() {
+            "FN" | "ORG" | "TEL" | "EMAIL" => lines.push(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        text.to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// The summary, date and place of an iCalendar event, for the card.
+fn summarize_ical(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let (key, value) = line.split_once(':').unwrap_or((line, ""));
+        let key = key.split(';').next().unwrap_or("").to_ascii_uppercase();
+        match key.as_str() {
+            "SUMMARY" | "DTSTART" | "LOCATION" => lines.push(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        text.to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn timestamp() -> String {

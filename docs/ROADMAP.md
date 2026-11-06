@@ -20,13 +20,15 @@ ordered by value for effort; each one leaves the app working and shippable.
 
 ## Phase 2: QR codes and barcodes
 
-- Decode on the analysis tap with `rxing` (pure Rust) in a worker thread,
-  a few frames a second while "Scan codes" is on.
-- Outline the code on the overlay. Offer the payload with smart actions:
-  open URL, copy text, join Wi-Fi (`WIFI:` payloads through NetworkManager),
-  save vCard / iCal.
-- EAN, Code 128 and Data Matrix come free with the same decoder.
-- Debounce so one code produces one result.
+- [x] Decode on the analysis tap with `rxing` (pure Rust) in a worker
+      thread, five frames a second while "Scan Codes" is on.
+- [x] Outline the code on the overlay in the accent colour. A card offers
+      the payload with the right action: open a link, join Wi-Fi (`WIFI:`
+      payloads through `nmcli`), save a vCard or iCalendar event, copy.
+- [x] EAN, UPC, Code 128, Code 39, ITF, Data Matrix, Aztec and PDF417 come
+      with the same decoder.
+- [x] One code, one card: a code stays on the card until a different one
+      appears; a dismissed code stays dismissed until it leaves the frame.
 
 ## Phase 3: Text recognition with click-to-copy
 

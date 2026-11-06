@@ -2,6 +2,7 @@
 //! following the Omarchy theme.
 
 mod camera;
+mod codes;
 mod omarchy;
 mod settings;
 mod stats;
@@ -22,7 +23,9 @@ const CSS: &str = "
 .viewfinder-frame { background-color: black; }
 picture.viewfinder.mirrored { transform: scaleX(-1); }
 .flash { background-color: white; }
-.stats { padding: 12px 14px; border-radius: 12px; }
+.stats, .code { padding: 12px 14px; border-radius: 12px; }
+.code { min-width: 280px; }
+.code .payload { font-family: monospace; }
 .timer { padding: 6px 12px; border-radius: 999px; font-weight: bold; }
 label.countdown {
   font-size: 160px; font-weight: 800; color: white;
