@@ -4,6 +4,7 @@
 mod camera;
 mod codes;
 mod controls;
+mod gifcap;
 mod motion;
 mod omarchy;
 mod scan;
@@ -69,15 +70,64 @@ button.shutter > .inner {
 }
 button.shutter.photo > .inner { background-color: white; }
 button.shutter.video > .inner { background-color: var(--error-bg-color); }
+button.shutter.gif > .inner { background-color: var(--accent-bg-color); }
+button.shutter.gif.recording > .inner { background-color: var(--accent-bg-color); }
 button.shutter.recording > .inner {
   min-width: 26px; min-height: 26px; border-radius: 6px;
   background-color: var(--error-bg-color);
 }
 ";
 
+/// Activate a window action (or `quit`) on the running instance.
+fn do_action(action: Option<&String>, value: Option<&String>) -> Result<(), String> {
+    use gtk::gio;
+    let action = action.ok_or(
+        "usage: gaze --do ACTION [VALUE]\n  e.g. gaze --do shutter, gaze --do mode video, \
+         gaze --do effect twirl, gaze --do timer 3, gaze --do quit",
+    )?;
+    let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .map_err(|e| format!("session bus: {e}"))?;
+    let path = if action == "quit" {
+        "/io/github/turbinebmw/Gaze"
+    } else {
+        "/io/github/turbinebmw/Gaze/window/1"
+    };
+    // (sava{sv}): the action, its parameter (at most one, boxed), and an
+    // empty platform data dictionary.
+    let parameter =
+        glib::Variant::array_from_iter::<glib::Variant>(value.map(|v| v.to_variant().to_variant()));
+    let platform = glib::VariantDict::new(None).end();
+    let args = glib::Variant::tuple_from_iter([action.to_variant(), parameter, platform]);
+    bus.call_sync(
+        Some(APP_ID),
+        path,
+        "org.gtk.Actions",
+        "Activate",
+        Some(&args),
+        None,
+        gio::DBusCallFlags::NONE,
+        5000,
+        gio::Cancellable::NONE,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Gaze is not running, or no such action: {e}"))
+}
+
 fn main() -> glib::ExitCode {
     // `gaze --add-virtual-camera` is what Gaze runs as root (through pkexec)
     // to make the loopback device; it prints the device and exits.
+    // `gaze --do ACTION [VALUE]` drives a running Gaze over D-Bus: handy
+    // for Hyprland keybindings and scripts.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--do") {
+        return match do_action(args.get(2), args.get(3)) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
     let root_task = match std::env::args().nth(1).as_deref() {
         Some(vcam::ADD_FLAG) => Some(vcam::add_as_root().map(|p| p.display().to_string())),
         Some(vcam::INSTALL_FLAG) => Some(vcam::install_service_as_root().map(|_| String::new())),

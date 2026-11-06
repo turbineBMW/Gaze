@@ -6,6 +6,7 @@ use crate::camera::{
 };
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::controls;
+use crate::gifcap::{self, GifCapture};
 use crate::motion;
 use crate::scan;
 use crate::settings::{Settings, LAPSES, TIMERS};
@@ -24,6 +25,26 @@ use std::time::{Duration, Instant};
 enum Mode {
     Photo,
     Video,
+    Gif,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Photo => "photo",
+            Mode::Video => "video",
+            Mode::Gif => "gif",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Mode> {
+        match name {
+            "photo" => Some(Mode::Photo),
+            "video" => Some(Mode::Video),
+            "gif" => Some(Mode::Gif),
+            _ => None,
+        }
+    }
 }
 
 /// A photo or recording made this session, for the gallery.
@@ -139,6 +160,9 @@ pub struct Window {
     lapse: Cell<u32>,
     /// The page found by Scan Document, outlined while it is processed.
     scan_quad: RefCell<Option<scan::Quad>>,
+    /// A GIF being captured, and since when.
+    gif: RefCell<Option<GifCapture>>,
+    gif_since: Cell<Option<Instant>>,
     /// The effects picker's live previews while it is open.
     previews: RefCell<Option<Previews>>,
     thumb_sender: async_channel::Sender<Thumb>,
@@ -197,6 +221,8 @@ impl Window {
             motion_last_shot: Cell::new(None),
             lapse: Cell::new(settings.lapse),
             scan_quad: RefCell::new(None),
+            gif: RefCell::new(None),
+            gif_since: Cell::new(None),
             previews: RefCell::new(None),
             thumb_sender,
             settings: RefCell::new(settings),
@@ -303,21 +329,16 @@ impl Window {
             #[weak(rename_to = this)]
             self,
             move |toggle| {
-                let mode = if toggle.active_name().as_deref() == Some("video") {
-                    Mode::Video
-                } else {
-                    Mode::Photo
-                };
+                let mode = toggle
+                    .active_name()
+                    .as_deref()
+                    .and_then(Mode::from_name)
+                    .unwrap_or(Mode::Photo);
                 this.mode.set(mode);
                 this.update_shutter();
                 if let Some(action) = this.ui.window.lookup_action("mode") {
                     if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
-                        let name = if mode == Mode::Video {
-                            "video"
-                        } else {
-                            "photo"
-                        };
-                        action.set_state(&name.to_variant());
+                        action.set_state(&mode.name().to_variant());
                     }
                 }
             }
@@ -540,7 +561,7 @@ impl Window {
             #[weak(rename_to = this)]
             self,
             move |_, value| {
-                if let Some(name @ ("photo" | "video")) = value.and_then(|v| v.str()) {
+                if let Some(name @ ("photo" | "video" | "gif")) = value.and_then(|v| v.str()) {
                     this.ui.mode_toggle.set_active_name(Some(name));
                 }
             }
@@ -1841,6 +1862,46 @@ impl Window {
         picture.set_paintable(Some(&texture));
     }
 
+    /// Stop the GIF capture and encode what it collected.
+    fn finish_gif(self: &Rc<Self>) {
+        let Some(capture) = self.gif.take() else {
+            return;
+        };
+        self.gif_since.set(None);
+        let frames = match self.camera.borrow().as_ref() {
+            Some(camera) => capture.stop(camera),
+            None => Vec::new(),
+        };
+        self.update_shutter();
+        if frames.is_empty() {
+            self.ui
+                .toasts
+                .add_toast(adw::Toast::new("No frames for the GIF"));
+            return;
+        }
+        self.ui.timer.set_label("Saving…");
+        self.ui.timer.set_visible(true);
+        let thumb = scan::thumbnail(&frames[0], camera::THUMBNAIL_WIDTH as usize);
+        let path = photos_dir().join(format!("Gaze {}.gif", timestamp()));
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            match gifcap::encode(frames, path).await {
+                Ok(path) => {
+                    this.add_capture(path.clone(), Some(thumb), false);
+                    this.notify_capture("GIF saved", &path);
+                    this.toast_file("GIF saved", path);
+                }
+                Err(error) => this
+                    .ui
+                    .toasts
+                    .add_toast(adw::Toast::new(&format!("Could not save the GIF: {error}"))),
+            }
+            if this.gif.borrow().is_none() {
+                this.ui.timer.set_visible(false);
+            }
+        });
+    }
+
     /// Take a photo of the frame on screen and file it.
     fn snap_photo(self: &Rc<Self>, title: &'static str) {
         let camera = self.camera.borrow();
@@ -2222,7 +2283,8 @@ impl Window {
             .camera
             .borrow()
             .as_ref()
-            .is_some_and(Camera::is_recording);
+            .is_some_and(Camera::is_recording)
+            || self.gif.borrow().is_some();
         let secs = self.timer_secs.get();
         if secs > 0 && !recording && self.camera.borrow().is_some() {
             self.start_countdown(secs);
@@ -2238,6 +2300,30 @@ impl Window {
         };
         match self.mode.get() {
             Mode::Photo => self.snap_photo("Photo saved"),
+            Mode::Gif => {
+                if self.gif.borrow().is_some() {
+                    self.finish_gif();
+                } else {
+                    self.gif.replace(Some(GifCapture::start(camera)));
+                    self.gif_since.set(Some(Instant::now()));
+                    self.ui.timer.set_label("GIF 00:00");
+                    glib::timeout_add_local_once(
+                        Duration::from_secs(gifcap::MAX_SECONDS),
+                        glib::clone!(
+                            #[weak(rename_to = this)]
+                            self,
+                            move || {
+                                if this.gif_since.get().is_some_and(|s| {
+                                    s.elapsed() >= Duration::from_secs(gifcap::MAX_SECONDS)
+                                }) {
+                                    this.finish_gif();
+                                }
+                            }
+                        ),
+                    );
+                }
+                self.update_shutter();
+            }
             Mode::Video => {
                 if camera.is_recording() {
                     if self.recording_since.get().is_some() {
@@ -2280,21 +2366,31 @@ impl Window {
             .borrow()
             .as_ref()
             .is_some_and(Camera::is_recording);
+        let capturing_gif = self.gif.borrow().is_some();
         let counting = self.counting_down();
         let shutter = &self.ui.shutter;
-        for class in ["photo", "video", "recording"] {
+        for class in ["photo", "video", "gif", "recording"] {
             shutter.remove_css_class(class);
         }
-        match (self.mode.get(), recording) {
-            (_, true) => {
+        match (self.mode.get(), recording, capturing_gif) {
+            (_, true, _) => {
                 shutter.add_css_class("recording");
                 shutter.set_tooltip_text(Some("Stop Recording"));
             }
-            (Mode::Video, false) => {
+            (_, _, true) => {
+                shutter.add_css_class("gif");
+                shutter.add_css_class("recording");
+                shutter.set_tooltip_text(Some("Finish GIF"));
+            }
+            (Mode::Video, ..) => {
                 shutter.add_css_class("video");
                 shutter.set_tooltip_text(Some("Start Recording"));
             }
-            (Mode::Photo, false) => {
+            (Mode::Gif, ..) => {
+                shutter.add_css_class("gif");
+                shutter.set_tooltip_text(Some("Capture GIF"));
+            }
+            (Mode::Photo, ..) => {
                 shutter.add_css_class("photo");
                 shutter.set_tooltip_text(Some("Take Photo"));
             }
@@ -2302,9 +2398,10 @@ impl Window {
         if counting {
             shutter.set_tooltip_text(Some("Cancel Timer"));
         }
-        self.ui.timer.set_visible(recording);
+        self.ui.timer.set_visible(recording || capturing_gif);
         self.ui.pause_button.set_visible(recording);
         self.ui.level.set_visible(recording);
+        let recording = recording || capturing_gif;
         if !recording {
             self.ui.level.set_value(0.0);
             self.ui.pause_button.set_active(false);
@@ -2343,6 +2440,12 @@ impl Window {
             } else {
                 format!("{:02}:{:02}", s / 60, s % 60)
             });
+        }
+        if let Some(since) = self.gif_since.get() {
+            let s = since.elapsed().as_secs();
+            self.ui
+                .timer
+                .set_label(&format!("GIF {:02}:{:02}", s / 60, s % 60));
         }
         if self.motion_on.get() {
             self.check_motion();
@@ -2674,6 +2777,13 @@ fn build_ui(app: &adw::Application) -> Ui {
             .name("video")
             .icon_name("camera-video-symbolic")
             .tooltip("Video")
+            .build(),
+    );
+    mode_toggle.add(
+        adw::Toggle::builder()
+            .name("gif")
+            .icon_name("media-playlist-repeat-symbolic")
+            .tooltip("GIF")
             .build(),
     );
     mode_toggle.set_active_name(Some("photo"));
