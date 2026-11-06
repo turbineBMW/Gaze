@@ -39,6 +39,16 @@ pub struct CameraInfo {
     pub formats: Vec<Format>,
 }
 
+impl CameraInfo {
+    /// The V4L2 node, for controls; `None` for other kinds of source.
+    pub fn device_path(&self) -> Option<PathBuf> {
+        match &self.source {
+            Source::V4l2(path) => Some(PathBuf::from(path)),
+            Source::Device(_) => None,
+        }
+    }
+}
+
 /// A size and frame rate a camera can deliver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Format {

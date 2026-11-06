@@ -5,6 +5,7 @@ use crate::camera::{
     self, Camera, CameraInfo, Effect, Event, Format, LatestFrame, Tap, TapId, EFFECTS,
 };
 use crate::codes::{self, Code, Payload, Scanner};
+use crate::controls;
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
@@ -70,6 +71,9 @@ struct Ui {
     thumb_button: gtk::MenuButton,
     thumb_picture: gtk::Picture,
     gallery: gtk::FlowBox,
+    /// The camera controls popover's content, rebuilt per camera.
+    controls_box: gtk::Box,
+    controls_button: gtk::MenuButton,
 }
 
 pub struct Window {
@@ -117,6 +121,8 @@ pub struct Window {
     /// is paused now.
     paused_total: Cell<Duration>,
     paused_at: Cell<Option<Instant>>,
+    /// The open camera's V4L2 node, for its controls.
+    device_path: RefCell<Option<PathBuf>>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -163,6 +169,7 @@ impl Window {
             burst_count: Cell::new(0),
             paused_total: Cell::new(Duration::ZERO),
             paused_at: Cell::new(None),
+            device_path: RefCell::new(None),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -605,6 +612,16 @@ impl Window {
         window.add_action(&gallery);
         app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
 
+        // The camera controls popover, from the keyboard.
+        let controls_action = gio::SimpleAction::new("controls", None);
+        controls_action.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.ui.controls_button.popup()
+        ));
+        window.add_action(&controls_action);
+        app.set_accels_for_action("win.controls", &["<Control><Shift>k"]);
+
         // Copy the last photo to the clipboard.
         let copy_last = gio::SimpleAction::new("copy-last", None);
         copy_last.connect_activate(glib::clone!(
@@ -887,6 +904,8 @@ impl Window {
             .and_then(Format::parse)
             .filter(|f| info.formats.contains(f));
         self.fill_formats_menu(info, format.as_ref());
+        self.device_path.replace(info.device_path());
+        self.fill_controls();
         let weak = Rc::downgrade(self);
         match Camera::open(info, format.as_ref(), move |event| {
             if let Some(this) = weak.upgrade() {
@@ -966,6 +985,126 @@ impl Window {
         } else {
             "Stop Recording"
         }));
+    }
+
+    /// The controls popover: a row per V4L2 control of the open camera,
+    /// and Reset.
+    fn fill_controls(self: &Rc<Self>) {
+        let content = &self.ui.controls_box;
+        while let Some(child) = content.first_child() {
+            content.remove(&child);
+        }
+        let device = self.device_path.borrow().clone();
+        let controls = device.as_deref().map(controls::list).unwrap_or_default();
+        if controls.is_empty() {
+            let label = gtk::Label::builder()
+                .label("This camera has no adjustable controls.")
+                .wrap(true)
+                .max_width_chars(32)
+                .build();
+            label.add_css_class("dim-label");
+            content.append(&label);
+            return;
+        }
+        let Some(device) = device else {
+            return;
+        };
+        let apply = {
+            let device = device.clone();
+            let this = self.clone();
+            move |id: u32, value: i64| {
+                if let Err(error) = controls::set(&device, id, value) {
+                    this.ui
+                        .toasts
+                        .add_toast(adw::Toast::new(&format!("Control not set: {error}")));
+                }
+            }
+        };
+        let apply = Rc::new(apply);
+        for control in &controls {
+            let row = gtk::Box::builder().spacing(10).build();
+            let label = gtk::Label::builder()
+                .label(&control.name)
+                .xalign(0.0)
+                .width_chars(18)
+                .max_width_chars(18)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .tooltip_text(&control.name)
+                .build();
+            row.append(&label);
+            let id = control.id;
+            let widget: gtk::Widget = match &control.kind {
+                controls::Kind::Integer { min, max, step, .. } => {
+                    let scale = gtk::Scale::with_range(
+                        gtk::Orientation::Horizontal,
+                        *min as f64,
+                        *max as f64,
+                        *step as f64,
+                    );
+                    scale.set_value(control.value as f64);
+                    scale.set_hexpand(true);
+                    scale.set_draw_value(true);
+                    scale.set_value_pos(gtk::PositionType::Right);
+                    scale.set_digits(0);
+                    scale.set_width_request(180);
+                    let apply = apply.clone();
+                    scale.connect_value_changed(move |s| apply(id, s.value().round() as i64));
+                    scale.upcast()
+                }
+                controls::Kind::Boolean { .. } => {
+                    let switch = gtk::Switch::builder()
+                        .active(control.value != 0)
+                        .halign(gtk::Align::End)
+                        .hexpand(true)
+                        .valign(gtk::Align::Center)
+                        .build();
+                    let apply = apply.clone();
+                    switch.connect_state_set(move |_, on| {
+                        apply(id, i64::from(on));
+                        glib::Propagation::Proceed
+                    });
+                    switch.upcast()
+                }
+                controls::Kind::Menu { items, .. } => {
+                    let names: Vec<&str> = items.iter().map(|(_, n)| n.as_str()).collect();
+                    let dropdown = gtk::DropDown::from_strings(&names);
+                    if let Some(i) = items.iter().position(|(v, _)| *v == control.value) {
+                        dropdown.set_selected(i as u32);
+                    }
+                    dropdown.set_hexpand(true);
+                    let values: Vec<i64> = items.iter().map(|(v, _)| *v).collect();
+                    let apply = apply.clone();
+                    dropdown.connect_selected_notify(move |d| {
+                        if let Some(v) = values.get(d.selected() as usize) {
+                            apply(id, *v);
+                        }
+                    });
+                    dropdown.upcast()
+                }
+            };
+            widget.set_sensitive(!control.inactive && !control.read_only);
+            row.append(&widget);
+            content.append(&row);
+        }
+        let reset = gtk::Button::builder()
+            .label("Reset to Defaults")
+            .halign(gtk::Align::End)
+            .margin_top(6)
+            .build();
+        reset.add_css_class("pill");
+        reset.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                for control in &controls {
+                    if !control.read_only {
+                        let _ = controls::set(&device, control.id, control.default_value());
+                    }
+                }
+                this.fill_controls();
+            }
+        ));
+        content.append(&reset);
     }
 
     fn current_camera_name(&self) -> Option<String> {
@@ -2219,6 +2358,25 @@ fn build_ui(app: &adw::Application) -> Ui {
     left.append(&mode_toggle);
     left.append(&timer_button);
     left.append(&effects_button());
+    let controls_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(10)
+        .margin_end(10)
+        .width_request(380)
+        .build();
+    let controls_popover = gtk::Popover::builder().child(&controls_box).build();
+    let controls_button = gtk::MenuButton::builder()
+        .icon_name("emblem-system-symbolic")
+        .popover(&controls_popover)
+        .tooltip_text("Camera Controls")
+        .valign(gtk::Align::Center)
+        .build();
+    controls_button.add_css_class("osd");
+    controls_button.add_css_class("circular");
+    left.append(&controls_button);
     controls.set_start_widget(Some(&left));
     controls.set_center_widget(Some(&shutter));
     let scan_button = gtk::ToggleButton::builder()
@@ -2405,6 +2563,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         thumb_button,
         thumb_picture,
         gallery,
+        controls_box,
+        controls_button,
     }
 }
 
