@@ -3,9 +3,16 @@
 //! ```text
 //! source ! capsfilter (raw, system memory, <= 1080p) ! tee
 //!   tee. ! queue (leaky) ! gtk4paintablesink                 viewfinder + photos
-//!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! appsink (RGB)   stats
+//!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! capsfilter ! appsink (RGB)
+//!                                                              analysis taps
 //!   tee. ! [recording bin: H.264 (VA-API) + AAC -> MP4]      added while recording
 //! ```
+//!
+//! The analysis branch is one CPU path shared by everything that wants to
+//! look at frames (colour statistics, code scanning, text recognition): each
+//! consumer registers a [`Tap`] saying how large and how often it needs
+//! frames, and the branch is scaled and rate-limited to the most demanding
+//! one. The valve keeps it empty while nobody is tapping.
 //!
 //! V4L2 cameras are opened directly with `v4l2src`, the way Chromium opens
 //! them; anything else (libcamera) through the PipeWire device's own element.
@@ -18,6 +25,7 @@
 use gst::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub struct CameraInfo {
     pub name: String,
@@ -83,13 +91,74 @@ pub enum Event {
     RecordingFailed(String),
 }
 
+/// A frame from the analysis branch: packed RGB, 3 bytes a pixel, `stride`
+/// bytes a row.
+#[derive(Clone)]
+pub struct Frame {
+    pub rgb: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+}
+
+/// What a consumer wants from the analysis branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tap {
+    /// Scale frames down to at most this many pixels wide; `None` for the
+    /// camera's own size.
+    pub max_width: Option<u32>,
+    /// Frames a second, at most.
+    pub fps: u32,
+}
+
+pub type TapId = u64;
+
+/// Runs on the streaming thread with each frame; must return quickly and
+/// must not touch the [`Camera`].
+type Handler = Box<dyn Fn(&Frame) + Send + 'static>;
+
+#[derive(Default)]
+struct Taps {
+    next_id: TapId,
+    list: Vec<(TapId, Tap, Handler)>,
+}
+
+impl Taps {
+    /// The one tap that satisfies all of them.
+    fn union(&self) -> Option<Tap> {
+        self.list.iter().map(|(_, tap, _)| *tap).reduce(|a, b| Tap {
+            max_width: match (a.max_width, b.max_width) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                _ => None,
+            },
+            fps: a.fps.max(b.fps),
+        })
+    }
+}
+
+/// Keeps the newest frame for a consumer that polls from the main loop.
+#[derive(Clone, Default)]
+pub struct LatestFrame(Arc<Mutex<Option<Frame>>>);
+
+impl LatestFrame {
+    pub fn store(&self, frame: &Frame) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame.clone());
+    }
+
+    pub fn take(&self) -> Option<Frame> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
 pub struct Camera {
     pipeline: gst::Pipeline,
     paintable: gdk::Paintable,
     preview: gst::Element,
     tee: gst::Element,
-    stats_valve: gst::Element,
-    stats_sink: gst_app::AppSink,
+    tap_valve: gst::Element,
+    tap_rate: gst::Element,
+    tap_filter: gst::Element,
+    taps: Arc<Mutex<Taps>>,
     recording: std::cell::RefCell<Option<Recording>>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
@@ -134,32 +203,51 @@ impl Camera {
         let preview = make("gtk4paintablesink")?;
         preview.set_property("enable-last-sample", true);
 
-        let stats_valve = make("valve")?;
-        stats_valve.set_property("drop", true);
-        let stats_queue = make("queue")?;
-        stats_queue.set_property("max-size-buffers", 1u32);
-        stats_queue.set_property_from_str("leaky", "downstream");
-        let rate = make("videorate")?;
-        rate.set_property("drop-only", true);
-        rate.set_property("max-rate", 4i32);
+        // Analysis branch, shared by every tap.
+        let tap_valve = make("valve")?;
+        tap_valve.set_property("drop", true);
+        let tap_queue = make("queue")?;
+        tap_queue.set_property("max-size-buffers", 1u32);
+        tap_queue.set_property_from_str("leaky", "downstream");
+        let tap_rate = make("videorate")?;
+        tap_rate.set_property("drop-only", true);
+        tap_rate.set_property("max-rate", 4i32);
         let convert = make("videoconvert")?;
         let scale = make("videoscale")?;
-        let stats_sink = gst_app::AppSink::builder()
+        let tap_filter = make("capsfilter")?;
+        tap_filter.set_property("caps", tap_caps(None));
+        let taps: Arc<Mutex<Taps>> = Arc::default();
+        let tap_sink = gst_app::AppSink::builder()
             .caps(
                 &gst::Caps::builder("video/x-raw")
                     .field("format", "RGB")
-                    .field("width", 480i32)
-                    .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
                     .build(),
             )
             .max_buffers(1)
             .drop(true)
             .sync(false)
+            .callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample({
+                        let taps = taps.clone();
+                        move |sink| {
+                            let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                            if let Some(frame) = frame_from_sample(&sample) {
+                                let taps = taps.lock().unwrap_or_else(|e| e.into_inner());
+                                for (_, _, handler) in &taps.list {
+                                    handler(&frame);
+                                }
+                            }
+                            Ok(gst::FlowSuccess::Ok)
+                        }
+                    })
+                    .build(),
+            )
             .build();
-        // The valve keeps this branch empty until the card is shown; a sink
+        // The valve keeps this branch empty until someone taps it; a sink
         // that waited for a first frame there would hold the whole pipeline
         // in PAUSED.
-        stats_sink.set_async(false);
+        tap_sink.set_async(false);
 
         let elements = [
             &source,
@@ -167,24 +255,26 @@ impl Camera {
             &tee,
             &preview_queue,
             &preview,
-            &stats_valve,
-            &stats_queue,
-            &rate,
+            &tap_valve,
+            &tap_queue,
+            &tap_rate,
             &convert,
             &scale,
-            stats_sink.upcast_ref(),
+            &tap_filter,
+            tap_sink.upcast_ref(),
         ];
         pipeline.add_many(elements).map_err(|e| e.to_string())?;
         gst::Element::link_many([&source, &filter, &tee]).map_err(|e| e.to_string())?;
         gst::Element::link_many([&tee, &preview_queue, &preview]).map_err(|e| e.to_string())?;
         gst::Element::link_many([
             &tee,
-            &stats_valve,
-            &stats_queue,
-            &rate,
+            &tap_valve,
+            &tap_queue,
+            &tap_rate,
             &convert,
             &scale,
-            stats_sink.upcast_ref(),
+            &tap_filter,
+            tap_sink.upcast_ref(),
         ])
         .map_err(|e| e.to_string())?;
 
@@ -245,8 +335,10 @@ impl Camera {
             paintable,
             preview,
             tee,
-            stats_valve,
-            stats_sink,
+            tap_valve,
+            tap_rate,
+            tap_filter,
+            taps,
             recording: std::cell::RefCell::new(None),
             _bus_watch: bus_watch,
         })
@@ -256,22 +348,42 @@ impl Camera {
         self.paintable.clone()
     }
 
-    pub fn set_stats(&self, on: bool) {
-        self.stats_valve.set_property("drop", !on);
+    /// Start handing frames to `handler` (on the streaming thread). The
+    /// analysis branch is opened, or widened and sped up, to suit.
+    pub fn add_tap(&self, tap: Tap, handler: impl Fn(&Frame) + Send + 'static) -> TapId {
+        let id = {
+            let mut taps = self.taps.lock().unwrap_or_else(|e| e.into_inner());
+            let id = taps.next_id;
+            taps.next_id += 1;
+            taps.list.push((id, tap, Box::new(handler)));
+            id
+        };
+        self.configure_taps();
+        id
     }
 
-    /// The newest statistics frame as (RGB bytes, width, height, stride).
-    pub fn stats_frame(&self) -> Option<(Vec<u8>, usize, usize, usize)> {
-        let sample = self.stats_sink.try_pull_sample(gst::ClockTime::ZERO)?;
-        let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
-        let buffer = sample.buffer()?;
-        let map = buffer.map_readable().ok()?;
-        Some((
-            map.as_slice().to_vec(),
-            info.width() as usize,
-            info.height() as usize,
-            info.stride()[0] as usize,
-        ))
+    pub fn remove_tap(&self, id: TapId) {
+        self.taps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list
+            .retain(|(i, _, _)| *i != id);
+        self.configure_taps();
+    }
+
+    /// Set the analysis branch to the union of the taps, or close it.
+    fn configure_taps(&self) {
+        let union = self.taps.lock().unwrap_or_else(|e| e.into_inner()).union();
+        match union {
+            Some(tap) => {
+                self.tap_rate
+                    .set_property("max-rate", tap.fps.max(1) as i32);
+                self.tap_filter
+                    .set_property("caps", tap_caps(tap.max_width));
+                self.tap_valve.set_property("drop", false);
+            }
+            None => self.tap_valve.set_property("drop", true),
+        }
     }
 
     /// Save the frame on screen as a JPEG. Runs the conversion and encoding
@@ -431,6 +543,30 @@ impl Camera {
         let _ = rec.bin.set_state(gst::State::Null);
         let _ = self.pipeline.remove(&rec.bin);
     }
+}
+
+/// Caps for the analysis branch: RGB, square pixels, at most `max_width`
+/// wide.
+fn tap_caps(max_width: Option<u32>) -> gst::Caps {
+    let mut caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGB")
+        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
+    if let Some(width) = max_width {
+        caps = caps.field("width", gst::IntRange::new(1, width.max(1) as i32));
+    }
+    caps.build()
+}
+
+fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
+    let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
+    let buffer = sample.buffer()?;
+    let map = buffer.map_readable().ok()?;
+    Some(Frame {
+        rgb: map.as_slice().to_vec(),
+        width: info.width() as usize,
+        height: info.height() as usize,
+        stride: info.stride()[0] as usize,
+    })
 }
 
 fn save_jpeg(sample: &gst::Sample, path: &Path) -> Result<(), String> {

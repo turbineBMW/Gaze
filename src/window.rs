@@ -1,8 +1,8 @@
 //! The main window: viewfinder, shutter, camera picker and the colour
 //! statistics card.
 
-use crate::camera::{self, Camera, CameraInfo, Event};
-use crate::settings::Settings;
+use crate::camera::{self, Camera, CameraInfo, Event, LatestFrame, Tap, TapId};
+use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -23,7 +23,10 @@ struct Ui {
     stack: gtk::Stack,
     status: adw::StatusPage,
     picture: gtk::Picture,
-    roi_area: gtk::DrawingArea,
+    /// Drawn over the picture: the measured region, later code outlines.
+    overlay: gtk::DrawingArea,
+    countdown: gtk::Label,
+    timer_label: gtk::Label,
     stats_card: gtk::Box,
     stats_labels: Vec<gtk::Label>,
     swatch: gtk::DrawingArea,
@@ -42,6 +45,14 @@ pub struct Window {
     mode: Cell<Mode>,
     mirror: Cell<bool>,
     stats_on: Cell<bool>,
+    /// The stats card's tap on the open camera, and where its frames land.
+    stats_tap: Cell<Option<TapId>>,
+    stats_frames: LatestFrame,
+    /// Self-timer length in seconds; 0 is off.
+    timer_secs: Cell<u32>,
+    /// A countdown in progress: its ticking source and the seconds left.
+    countdown: RefCell<Option<glib::SourceId>>,
+    countdown_left: Cell<u32>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -60,6 +71,11 @@ impl Window {
             ui,
             mirror: Cell::new(settings.mirror),
             stats_on: Cell::new(false),
+            stats_tap: Cell::new(None),
+            stats_frames: LatestFrame::default(),
+            timer_secs: Cell::new(settings.timer),
+            countdown: RefCell::new(None),
+            countdown_left: Cell::new(0),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -74,6 +90,7 @@ impl Window {
         this.install_actions(app);
         this.refresh_cameras();
         this.apply_mirror();
+        this.apply_timer();
         this.ui.window.present();
         this
     }
@@ -146,7 +163,7 @@ impl Window {
                         w: (end.0 - start.0).abs(),
                         h: (end.1 - start.1).abs(),
                     }));
-                    this.ui.roi_area.queue_draw();
+                    this.ui.overlay.queue_draw();
                 }
             }
         ));
@@ -156,16 +173,19 @@ impl Window {
             move |_, dx, dy| {
                 if this.drag_start.take().is_some() && dx.abs() < 4.0 && dy.abs() < 4.0 {
                     this.region.set(None);
-                    this.ui.roi_area.queue_draw();
+                    this.ui.overlay.queue_draw();
                 }
             }
         ));
         ui.stack.add_controller(drag);
 
-        ui.roi_area.set_draw_func(glib::clone!(
+        ui.overlay.set_draw_func(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move |_, cr, _, _| {
+                if !this.stats_on.get() {
+                    return;
+                }
                 let (Some(r), Some((vx, vy, vw, vh))) = (this.region.get(), this.video_rect())
                 else {
                     return;
@@ -268,14 +288,58 @@ impl Window {
                 this.stats_on.set(on);
                 action.set_state(&on.to_variant());
                 this.ui.stats_card.set_visible(on);
-                this.ui.roi_area.set_visible(on);
-                if let Some(camera) = this.camera.borrow().as_ref() {
-                    camera.set_stats(on);
-                }
+                this.ui.overlay.queue_draw();
+                this.sync_stats_tap();
             }
         ));
         window.add_action(&stats);
         app.set_accels_for_action("win.stats", &["<Control>i"]);
+
+        // Self-timer: a radio over the lengths in TIMERS, as seconds in a
+        // string so a menu can target it.
+        let timer = gio::SimpleAction::new_stateful(
+            "timer",
+            Some(glib::VariantTy::STRING),
+            &self.timer_secs.get().to_string().to_variant(),
+        );
+        timer.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                let secs = value
+                    .and_then(|v| v.str())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|s| TIMERS.contains(s));
+                if let Some(secs) = secs {
+                    this.set_timer(secs);
+                }
+            }
+        ));
+        window.add_action(&timer);
+
+        // Ctrl+T steps through the timer lengths.
+        let cycle = gio::SimpleAction::new("cycle-timer", None);
+        cycle.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                let current = this.timer_secs.get();
+                let index = TIMERS.iter().position(|&t| t == current).unwrap_or(0);
+                this.set_timer(TIMERS[(index + 1) % TIMERS.len()]);
+            }
+        ));
+        window.add_action(&cycle);
+        app.set_accels_for_action("win.cycle-timer", &["<Control>t"]);
+
+        // Escape stops a countdown.
+        let cancel = gio::SimpleAction::new("cancel", None);
+        cancel.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.cancel_countdown()
+        ));
+        window.add_action(&cancel);
+        app.set_accels_for_action("win.cancel", &["Escape"]);
 
         for (name, dir) in [("open-photos", photos_dir()), ("open-videos", videos_dir())] {
             let action = gio::SimpleAction::new(name, None);
@@ -379,8 +443,9 @@ impl Window {
                 let paintable = camera.paintable();
                 log::info!("opened {}", info.name);
                 self.ui.picture.set_paintable(Some(&paintable));
-                camera.set_stats(self.stats_on.get());
+                self.stats_tap.set(None);
                 self.camera.replace(Some(camera));
+                self.sync_stats_tap();
                 self.ui.stack.set_visible_child_name("viewfinder");
                 self.update_shutter();
             }
@@ -406,7 +471,109 @@ impl Window {
                 action.set_state(&self.mirror.get().to_variant());
             }
         }
-        self.ui.roi_area.queue_draw();
+        self.ui.overlay.queue_draw();
+    }
+
+    /// Tap the open camera for the stats card exactly when it is shown.
+    fn sync_stats_tap(&self) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            self.stats_tap.set(None);
+            return;
+        };
+        match (self.stats_on.get(), self.stats_tap.get()) {
+            (true, None) => {
+                let frames = self.stats_frames.clone();
+                let tap = Tap {
+                    max_width: Some(480),
+                    fps: 4,
+                };
+                let id = camera.add_tap(tap, move |frame| frames.store(frame));
+                self.stats_tap.set(Some(id));
+            }
+            (false, Some(id)) => {
+                camera.remove_tap(id);
+                self.stats_tap.set(None);
+            }
+            _ => {}
+        }
+    }
+
+    fn set_timer(&self, secs: u32) {
+        self.timer_secs.set(secs);
+        self.settings.borrow_mut().timer = secs;
+        self.settings.borrow().save();
+        self.apply_timer();
+    }
+
+    fn apply_timer(&self) {
+        let secs = self.timer_secs.get();
+        if let Some(action) = self.ui.window.lookup_action("timer") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&secs.to_string().to_variant());
+            }
+        }
+        self.ui.timer_label.set_visible(secs > 0);
+        self.ui.timer_label.set_label(&format!("{secs} s"));
+    }
+
+    /// Count `secs` down on the overlay, then capture.
+    fn start_countdown(self: &Rc<Self>, secs: u32) {
+        self.cancel_countdown();
+        self.countdown_left.set(secs);
+        self.show_countdown();
+        let source = glib::timeout_add_local(
+            Duration::from_secs(1),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let left = this.countdown_left.get().saturating_sub(1);
+                    this.countdown_left.set(left);
+                    if left > 0 {
+                        this.show_countdown();
+                        return glib::ControlFlow::Continue;
+                    }
+                    this.countdown.replace(None);
+                    this.ui.countdown.set_visible(false);
+                    this.update_shutter();
+                    this.capture();
+                    glib::ControlFlow::Break
+                }
+            ),
+        );
+        self.countdown.replace(Some(source));
+        self.update_shutter();
+    }
+
+    fn show_countdown(&self) {
+        let label = &self.ui.countdown;
+        label.set_label(&self.countdown_left.get().to_string());
+        label.set_visible(true);
+        // Each second lands bright and fades towards the next.
+        label.set_opacity(1.0);
+        let target = adw::CallbackAnimationTarget::new(glib::clone!(
+            #[weak]
+            label,
+            move |value| label.set_opacity(value)
+        ));
+        let animation = adw::TimedAnimation::new(label, 1.0, 0.35, 900, target);
+        animation.set_easing(adw::Easing::EaseInCubic);
+        animation.play();
+    }
+
+    fn counting_down(&self) -> bool {
+        self.countdown.borrow().is_some()
+    }
+
+    fn cancel_countdown(&self) {
+        if let Some(source) = self.countdown.take() {
+            source.remove();
+            self.ui.countdown.set_visible(false);
+            self.update_shutter();
+        }
     }
 
     fn on_event(self: &Rc<Self>, event: Event) {
@@ -440,7 +607,27 @@ impl Window {
         }
     }
 
+    /// The shutter button: cancels a countdown, stops a recording, or starts
+    /// the self-timer or the capture itself.
     fn shutter(self: &Rc<Self>) {
+        if self.counting_down() {
+            self.cancel_countdown();
+            return;
+        }
+        let recording = self
+            .camera
+            .borrow()
+            .as_ref()
+            .is_some_and(Camera::is_recording);
+        let secs = self.timer_secs.get();
+        if secs > 0 && !recording && self.camera.borrow().is_some() {
+            self.start_countdown(secs);
+        } else {
+            self.capture();
+        }
+    }
+
+    fn capture(self: &Rc<Self>) {
         let camera = self.camera.borrow();
         let Some(camera) = camera.as_ref() else {
             return;
@@ -491,6 +678,7 @@ impl Window {
             .borrow()
             .as_ref()
             .is_some_and(Camera::is_recording);
+        let counting = self.counting_down();
         let shutter = &self.ui.shutter;
         for class in ["photo", "video", "recording"] {
             shutter.remove_css_class(class);
@@ -509,9 +697,14 @@ impl Window {
                 shutter.set_tooltip_text(Some("Take Photo"));
             }
         }
+        if counting {
+            shutter.set_tooltip_text(Some("Cancel Timer"));
+        }
         self.ui.timer.set_visible(recording);
-        self.ui.mode_toggle.set_sensitive(!recording);
-        self.ui.cameras_dropdown.set_sensitive(!recording);
+        self.ui.mode_toggle.set_sensitive(!recording && !counting);
+        self.ui
+            .cameras_dropdown
+            .set_sensitive(!recording && !counting);
         if !recording {
             self.ui.timer.set_label("00:00");
         }
@@ -538,10 +731,10 @@ impl Window {
         if !self.stats_on.get() {
             return;
         }
-        let frame = self.camera.borrow().as_ref().and_then(Camera::stats_frame);
-        let Some((rgb, w, h, stride)) = frame else {
+        let Some(frame) = self.stats_frames.take() else {
             return;
         };
+        let (rgb, w, h, stride) = (frame.rgb, frame.width, frame.height, frame.stride);
         // The region is chosen on the displayed picture; the frame is not
         // mirrored.
         let region = self.region.get().map(|r| {
@@ -659,10 +852,15 @@ fn build_ui(app: &adw::Application) -> Ui {
         .vexpand(true)
         .build();
     picture.add_css_class("viewfinder");
-    let roi_area = gtk::DrawingArea::builder()
+    let overlay_area = gtk::DrawingArea::builder().can_target(false).build();
+    let countdown = gtk::Label::builder()
         .can_target(false)
         .visible(false)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
         .build();
+    countdown.add_css_class("countdown");
+    countdown.add_css_class("numeric");
     let flash = gtk::Box::builder().can_target(false).opacity(0.0).build();
     flash.add_css_class("flash");
 
@@ -732,6 +930,32 @@ fn build_ui(app: &adw::Application) -> Ui {
     mode_toggle.set_active_name(Some("photo"));
     mode_toggle.add_css_class("osd");
     mode_toggle.add_css_class("round");
+
+    // Self-timer picker: a radio menu over win.timer.
+    let timer_menu = gio::Menu::new();
+    for secs in TIMERS {
+        let label = match secs {
+            0 => "Off".to_string(),
+            s => format!("{s} seconds"),
+        };
+        let item = gio::MenuItem::new(Some(&label), None);
+        item.set_action_and_target_value(Some("win.timer"), Some(&secs.to_string().to_variant()));
+        timer_menu.append_item(&item);
+    }
+    let timer_label = gtk::Label::builder().label("0 s").visible(false).build();
+    timer_label.add_css_class("numeric");
+    let timer_content = gtk::Box::builder().spacing(6).build();
+    timer_content.append(&gtk::Image::from_icon_name("alarm-symbolic"));
+    timer_content.append(&timer_label);
+    let timer_button = gtk::MenuButton::builder()
+        .child(&timer_content)
+        .menu_model(&timer_menu)
+        .tooltip_text("Self-Timer")
+        .valign(gtk::Align::Center)
+        .build();
+    timer_button.add_css_class("osd");
+    timer_button.add_css_class("pill");
+    timer_button.add_css_class("self-timer");
     let inner = gtk::Box::builder()
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
@@ -758,8 +982,10 @@ fn build_ui(app: &adw::Application) -> Ui {
     let left = gtk::Box::builder()
         .halign(gtk::Align::Start)
         .valign(gtk::Align::Center)
+        .spacing(10)
         .build();
     left.append(&mode_toggle);
+    left.append(&timer_button);
     controls.set_start_widget(Some(&left));
     controls.set_center_widget(Some(&shutter));
     let right = gtk::Box::builder()
@@ -771,7 +997,8 @@ fn build_ui(app: &adw::Application) -> Ui {
 
     let overlay = gtk::Overlay::builder().child(&picture).build();
     overlay.add_css_class("viewfinder-frame");
-    overlay.add_overlay(&roi_area);
+    overlay.add_overlay(&overlay_area);
+    overlay.add_overlay(&countdown);
     overlay.add_overlay(&flash);
     overlay.add_overlay(&stats_card);
     overlay.add_overlay(&controls);
@@ -803,7 +1030,9 @@ fn build_ui(app: &adw::Application) -> Ui {
         stack,
         status,
         picture,
-        roi_area,
+        overlay: overlay_area,
+        countdown,
+        timer_label,
         stats_card,
         stats_labels,
         swatch,

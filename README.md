@@ -17,11 +17,15 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Self-timer (3, 5 or 10 s; Ctrl+T cycles it) for photos and recordings, with
+  a countdown on the picture. Escape or the shutter cancels.
 - Colour statistics (Ctrl+I): black and white level, mean level, saturation,
   and the colour of a region you drag on the picture. Handy for judging a
   camera's tuning without guessing from a screenshot.
-- Remembers the camera you picked and the mirror setting
+- Remembers the camera you picked, the mirror setting and the timer
   (`~/.config/gaze/settings`).
+
+Where it is going: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Building and installing
 
