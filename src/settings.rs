@@ -17,6 +17,9 @@ pub struct Settings {
     pub grid: bool,
     /// Chosen format per camera name, as `Format::id` strings.
     pub formats: Vec<(String, String)>,
+    /// The microphone to record with (a PipeWire node name); `None` is the
+    /// default one.
+    pub mic: Option<String>,
 }
 
 /// The self-timer lengths offered, in seconds.
@@ -35,6 +38,7 @@ impl Settings {
             virtual_camera: false,
             grid: false,
             formats: Vec::new(),
+            mic: None,
         };
         let Ok(text) = std::fs::read_to_string(path()) else {
             return settings;
@@ -45,6 +49,7 @@ impl Settings {
                 Some(("mirror", v)) => settings.mirror = v.trim() == "true",
                 Some(("virtual_camera", v)) => settings.virtual_camera = v.trim() == "true",
                 Some(("grid", v)) => settings.grid = v.trim() == "true",
+                Some(("mic", v)) if !v.trim().is_empty() => settings.mic = Some(v.trim().into()),
                 Some((key, v)) if key.starts_with("format.") && !v.trim().is_empty() => {
                     settings.set_format(&key["format.".len()..], Some(v.trim()));
                 }
@@ -91,6 +96,9 @@ impl Settings {
         );
         for (camera, format) in &self.formats {
             text.push_str(&format!("format.{camera}={format}\n"));
+        }
+        if let Some(mic) = &self.mic {
+            text.push_str(&format!("mic={mic}\n"));
         }
         if let Err(error) = std::fs::write(&path, text) {
             log::warn!("cannot save {}: {error}", path.display());

@@ -35,6 +35,8 @@ label.countdown {
 }
 menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
 popover.effects button { min-width: 92px; }
+levelbar.mic-level trough { min-height: 8px; background-color: rgb(0 0 0 / 45%); border: none; }
+levelbar.mic-level block { min-height: 8px; }
 button.thumb { padding: 3px; border-radius: 12px; min-width: 0; min-height: 0; }
 .thumb-frame { border-radius: 9px; }
 .gallery button { padding: 2px; border-radius: 10px; }

@@ -216,11 +216,50 @@ pub fn list() -> Vec<CameraInfo> {
     v4l2
 }
 
+/// A microphone, as PipeWire/PulseAudio names it.
+pub struct MicInfo {
+    pub name: String,
+    /// What `pulsesrc`'s `device` takes.
+    pub device: String,
+}
+
+/// The microphones the device monitor reports.
+pub fn mics() -> Vec<MicInfo> {
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Audio/Source"), None);
+    if let Err(error) = monitor.start() {
+        log::warn!("device monitor (audio): {error}");
+        return Vec::new();
+    }
+    let devices = monitor.devices();
+    monitor.stop();
+    let mut mics = Vec::new();
+    for device in devices {
+        let Some(props) = device.properties() else {
+            continue;
+        };
+        let Ok(node) = props.get::<String>("node.name") else {
+            continue;
+        };
+        // Monitors of outputs are not microphones.
+        if node.ends_with(".monitor") || mics.iter().any(|m: &MicInfo| m.device == node) {
+            continue;
+        }
+        mics.push(MicInfo {
+            name: device.display_name().to_string(),
+            device: node,
+        });
+    }
+    mics
+}
+
 /// What the bus watch tells the window.
 pub enum Event {
     Error(String),
     RecordingSaved(PathBuf),
     RecordingFailed(String),
+    /// The microphone's level while recording, 0 to 1.
+    AudioLevel(f64),
     /// The virtual camera branch failed and was removed.
     OutputFailed(String),
 }
@@ -340,6 +379,8 @@ pub struct Camera {
     taps: Arc<Mutex<Taps>>,
     recording: std::cell::RefCell<Option<Recording>>,
     output: std::cell::RefCell<Option<Recording>>,
+    /// Pause bookkeeping shared with the recorder's pad probes.
+    pauses: Arc<Mutex<Pauses>>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -347,6 +388,30 @@ pub struct Camera {
 struct Recording {
     bin: gst::Bin,
     tee_pad: gst::Pad,
+}
+
+/// Where a recording is paused, in pipeline running time (what buffers
+/// are stamped with). Buffers stamped after `pause_at` are dropped; once
+/// resumed, buffers from before `resume_at` are dropped too and later ones
+/// are shifted back by everything paused so far.
+#[derive(Default)]
+struct Pauses {
+    pause_at: Option<gst::ClockTime>,
+    resume_at: gst::ClockTime,
+    shift: u64,
+}
+
+impl Pauses {
+    /// What to do with a buffer stamped `pts`: `None` drops it, otherwise
+    /// the stamp to give it.
+    fn apply(&self, pts: gst::ClockTime) -> Option<gst::ClockTime> {
+        if self.pause_at.is_some_and(|p| pts >= p) || pts < self.resume_at {
+            return None;
+        }
+        Some(gst::ClockTime::from_nseconds(
+            pts.nseconds().saturating_sub(self.shift),
+        ))
+    }
 }
 
 fn make(factory: &str) -> Result<gst::Element, String> {
@@ -506,6 +571,11 @@ impl Camera {
                         let Some(s) = element.structure() else {
                             return glib::ControlFlow::Continue;
                         };
+                        if s.name() == "level" {
+                            if let Some(db) = level_db(s) {
+                                on_event(Event::AudioLevel(((db + 60.0) / 60.0).clamp(0.0, 1.0)));
+                            }
+                        }
                         if s.name() == "GstBinForwarded" {
                             if let Ok(inner) = s.get::<gst::Message>("message") {
                                 if let MessageView::Eos(_) = inner.view() {
@@ -544,6 +614,7 @@ impl Camera {
             taps,
             recording: std::cell::RefCell::new(None),
             output: std::cell::RefCell::new(None),
+            pauses: Arc::default(),
             _bus_watch: bus_watch,
         })
     }
@@ -678,9 +749,9 @@ impl Camera {
         self.recording.borrow().is_some()
     }
 
-    /// Start recording the camera and the default microphone to `path`
-    /// (H.264 on the GPU through VA-API, AAC, MP4).
-    pub fn start_recording(&self, path: &Path) -> Result<(), String> {
+    /// Start recording the camera and a microphone (`None`: the default) to
+    /// `path` (H.264 on the GPU through VA-API, AAC, MP4).
+    pub fn start_recording(&self, path: &Path, mic: Option<&str>) -> Result<(), String> {
         if self.is_recording() {
             return Ok(());
         }
@@ -688,7 +759,8 @@ impl Camera {
             "queue name=vq max-size-buffers=0 max-size-bytes=0 max-size-time=2000000000 \
                ! videoconvert ! vah264enc bitrate=8000 ! h264parse \
                ! mp4mux name=mux ! filesink name=out location=\"{}\" \
-             pulsesrc name=mic ! queue max-size-time=2000000000 ! audioconvert ! audioresample \
+             pulsesrc name=mic ! queue name=aq max-size-time=2000000000 ! audioconvert \
+               ! level interval=100000000 ! audioresample \
                ! audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=160000 ! aacparse ! mux.",
             path.display().to_string().replace('"', "\\\"")
         );
@@ -696,14 +768,55 @@ impl Camera {
             .map_err(|e| format!("cannot build the recorder: {e}"))?;
         bin.set_property("message-forward", true);
         bin.set_property("name", "recording");
+        if let (Some(mic), Some(device)) = (bin.by_name("mic"), mic) {
+            mic.set_property("device", device);
+        }
+
+        // Pausing: the queues' probes drop or restamp buffers. Pad offsets
+        // move the segment, not the stamps, so buffers carry pipeline
+        // running time and Pauses works in that.
+        *self.pauses.lock().unwrap_or_else(|e| e.into_inner()) = Pauses::default();
+        for queue in ["vq", "aq"] {
+            let Some(pad) = bin.by_name(queue).and_then(|q| q.static_pad("sink")) else {
+                continue;
+            };
+            let pauses = self.pauses.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(pts) = buffer.pts() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let decision = pauses.lock().unwrap_or_else(|e| e.into_inner()).apply(pts);
+                match decision {
+                    None => gst::PadProbeReturn::Drop,
+                    Some(stamped) => {
+                        if stamped != pts {
+                            let b = buffer.make_mut();
+                            b.set_pts(stamped);
+                            b.set_dts(None);
+                        }
+                        gst::PadProbeReturn::Ok
+                    }
+                }
+            });
+        }
 
         // Both branches reach the muxer in pipeline running time; start the
-        // file at zero.
-        let now = self
-            .pipeline
-            .current_running_time()
+        // file at zero. The anchor is the frame on screen, not the clock:
+        // the next frame to arrive is stamped a little before "now" (capture
+        // time plus the pipeline's latency), and a frame stamped before the
+        // segment start is clipped by the encoder, taking the opening
+        // keyframe with it.
+        let shown = self
+            .preview
+            .property::<Option<gst::Sample>>("last-sample")
+            .and_then(|s| s.buffer().and_then(|b| b.pts()));
+        let start = shown
+            .or_else(|| self.pipeline.current_running_time())
             .unwrap_or(gst::ClockTime::ZERO);
-        let offset = -(now.nseconds() as i64);
+        let offset = -(start.nseconds() as i64);
         let sink_pad = bin.static_pad("sink").ok_or("recorder has no input")?;
         sink_pad.set_offset(offset);
         if let Some(mic) = bin.by_name("mic").and_then(|m| m.static_pad("src")) {
@@ -723,10 +836,49 @@ impl Camera {
         Ok(())
     }
 
+    fn running_time(&self) -> Option<gst::ClockTime> {
+        if !self.is_recording() {
+            return None;
+        }
+        self.pipeline.current_running_time()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pause_at
+            .is_some()
+    }
+
+    /// Stop writing frames and sound until [`Camera::resume_recording`];
+    /// the file carries on as if the pause never happened.
+    pub fn pause_recording(&self) {
+        let Some(now) = self.running_time() else {
+            return;
+        };
+        let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+        if pauses.pause_at.is_none() {
+            pauses.pause_at = Some(now);
+        }
+    }
+
+    pub fn resume_recording(&self) {
+        let Some(now) = self.running_time() else {
+            return;
+        };
+        let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(paused_at) = pauses.pause_at.take() {
+            pauses.shift += now.nseconds().saturating_sub(paused_at.nseconds());
+            pauses.resume_at = now;
+        }
+    }
+
     /// End the recording: detach it from the camera and send end-of-stream
     /// through both branches. The file is complete when the bus reports
     /// [`Event::RecordingSaved`].
     pub fn stop_recording(&self) {
+        self.resume_recording();
         let recording = self.recording.borrow();
         let Some(rec) = recording.as_ref() else {
             return;
@@ -774,6 +926,18 @@ impl Drop for Camera {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// The loudest channel's RMS from a `level` message, in dB.
+fn level_db(s: &gst::StructureRef) -> Option<f64> {
+    let values: Vec<f64> = if let Ok(array) = s.get::<glib::ValueArray>("rms") {
+        array.iter().filter_map(|v| v.get::<f64>().ok()).collect()
+    } else if let Ok(list) = s.get::<gst::List>("rms") {
+        list.iter().filter_map(|v| v.get::<f64>().ok()).collect()
+    } else {
+        return None;
+    };
+    values.into_iter().reduce(f64::max)
 }
 
 fn in_bin(element: &gst::Element, name: &str) -> bool {
@@ -973,6 +1137,25 @@ mod tests {
         assert_eq!(plain.fps, None);
         assert_eq!(plain.label(), "640 × 480");
         assert_eq!(Format::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn pauses_drop_and_shift() {
+        let t = gst::ClockTime::from_mseconds;
+        let mut p = Pauses::default();
+        assert_eq!(p.apply(t(500)), Some(t(500)));
+        // Paused at 1 s: later stamps are dropped, earlier late ones pass.
+        p.pause_at = Some(t(1000));
+        assert_eq!(p.apply(t(990)), Some(t(990)));
+        assert_eq!(p.apply(t(1000)), None);
+        assert_eq!(p.apply(t(2500)), None);
+        // Resumed at 3 s: 2 s vanish; a straggler from the pause is dropped.
+        p.pause_at = None;
+        p.shift = 2000 * 1_000_000;
+        p.resume_at = t(3000);
+        assert_eq!(p.apply(t(2900)), None);
+        assert_eq!(p.apply(t(3000)), Some(t(1000)));
+        assert_eq!(p.apply(t(3033)), Some(t(1033)));
     }
 
     #[test]

@@ -62,6 +62,10 @@ struct Ui {
     toolbar: adw::ToolbarView,
     /// The Format submenu, refilled for each camera.
     formats_menu: gio::Menu,
+    /// The Microphone submenu, refilled with the cameras.
+    mics_menu: gio::Menu,
+    pause_button: gtk::ToggleButton,
+    level: gtk::LevelBar,
     /// The last capture, and the gallery popover behind it.
     thumb_button: gtk::MenuButton,
     thumb_picture: gtk::Picture,
@@ -109,6 +113,10 @@ pub struct Window {
     /// A burst in progress: its ticking source and how many so far.
     burst: RefCell<Option<glib::SourceId>>,
     burst_count: Cell<u32>,
+    /// Time the current recording has spent paused, and since when if it
+    /// is paused now.
+    paused_total: Cell<Duration>,
+    paused_at: Cell<Option<Instant>>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -153,6 +161,8 @@ impl Window {
             recording_thumb: RefCell::new(None),
             burst: RefCell::new(None),
             burst_count: Cell::new(0),
+            paused_total: Cell::new(Duration::ZERO),
+            paused_at: Cell::new(None),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -675,6 +685,40 @@ impl Window {
         window.add_action(&cancel);
         app.set_accels_for_action("win.cancel", &["Escape"]);
 
+        // Pause and resume the recording.
+        let pause = gio::SimpleAction::new_stateful("pause", None, &false.to_variant());
+        pause.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.toggle_pause()
+        ));
+        window.add_action(&pause);
+        app.set_accels_for_action("win.pause", &["<Control>p"]);
+
+        // The microphone: "default" or a PipeWire node name.
+        let mic = gio::SimpleAction::new_stateful(
+            "mic",
+            Some(glib::VariantTy::STRING),
+            &self
+                .settings
+                .borrow()
+                .mic
+                .clone()
+                .unwrap_or_else(|| "default".into())
+                .to_variant(),
+        );
+        mic.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, value| {
+                let id = value.and_then(|v| v.str()).unwrap_or("default");
+                action.set_state(&id.to_variant());
+                this.settings.borrow_mut().mic = Some(id.to_string()).filter(|m| m != "default");
+                this.settings.borrow().save();
+            }
+        ));
+        window.add_action(&mic);
+
         // The camera's format: "auto" or a Format id, remembered per camera.
         let format = gio::SimpleAction::new_stateful(
             "format",
@@ -792,6 +836,7 @@ impl Window {
             camera.close();
         }
         let cameras = camera::list();
+        self.fill_mics_menu();
         let names: Vec<&str> = cameras.iter().map(|c| c.name.as_str()).collect();
         let model = gtk::StringList::new(&names);
         let wanted = self.settings.borrow().camera.clone();
@@ -874,6 +919,53 @@ impl Window {
             }
             Err(error) => self.show_status("Camera Unavailable", &error),
         }
+    }
+
+    /// The Microphone submenu: Default plus each microphone, as radio items
+    /// over win.mic.
+    fn fill_mics_menu(&self) {
+        let menu = &self.ui.mics_menu;
+        menu.remove_all();
+        let item = gio::MenuItem::new(Some("Default"), None);
+        item.set_action_and_target_value(Some("win.mic"), Some(&"default".to_variant()));
+        menu.append_item(&item);
+        for mic in camera::mics() {
+            let item = gio::MenuItem::new(Some(&mic.name), None);
+            item.set_action_and_target_value(Some("win.mic"), Some(&mic.device.to_variant()));
+            menu.append_item(&item);
+        }
+    }
+
+    fn toggle_pause(&self) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref().filter(|c| c.is_recording()) else {
+            return;
+        };
+        if self.recording_since.get().is_none() {
+            return; // stopping already
+        }
+        let paused = !camera.is_paused();
+        if paused {
+            camera.pause_recording();
+            self.paused_at.set(Some(Instant::now()));
+        } else {
+            camera.resume_recording();
+            if let Some(at) = self.paused_at.take() {
+                self.paused_total
+                    .set(self.paused_total.get() + at.elapsed());
+            }
+        }
+        if let Some(action) = self.ui.window.lookup_action("pause") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&paused.to_variant());
+            }
+        }
+        self.ui.pause_button.set_active(paused);
+        self.ui.shutter.set_tooltip_text(Some(if paused {
+            "Stop Recording (paused)"
+        } else {
+            "Stop Recording"
+        }));
     }
 
     fn current_camera_name(&self) -> Option<String> {
@@ -1578,6 +1670,11 @@ impl Window {
                 self.notify_capture("Video saved", &path);
                 self.toast_file("Video saved", path);
             }
+            Event::AudioLevel(level) => {
+                // Hold peaks a little so the meter is readable.
+                let shown = self.ui.level.value();
+                self.ui.level.set_value(level.max(shown * 0.8));
+            }
             Event::OutputFailed(text) => {
                 if let Some(camera) = self.camera.borrow().as_ref() {
                     camera.stop_output();
@@ -1663,9 +1760,13 @@ impl Window {
                             .add_toast(adw::Toast::new(&error.to_string()));
                         return;
                     }
-                    match camera.start_recording(&path) {
+                    let mic = self.settings.borrow().mic.clone();
+                    match camera.start_recording(&path, mic.as_deref()) {
                         Ok(()) => {
                             self.recording_since.set(Some(Instant::now()));
+                            self.paused_total.set(Duration::ZERO);
+                            self.paused_at.set(None);
+                            self.ui.pause_button.set_active(false);
                             let snapshot = camera.snapshot();
                             let this = self.clone();
                             glib::spawn_future_local(async move {
@@ -1709,6 +1810,12 @@ impl Window {
             shutter.set_tooltip_text(Some("Cancel Timer"));
         }
         self.ui.timer.set_visible(recording);
+        self.ui.pause_button.set_visible(recording);
+        self.ui.level.set_visible(recording);
+        if !recording {
+            self.ui.level.set_value(0.0);
+            self.ui.pause_button.set_active(false);
+        }
         self.ui.mode_toggle.set_sensitive(!recording && !counting);
         self.ui
             .cameras_dropdown
@@ -1731,7 +1838,12 @@ impl Window {
 
     fn tick(&self) {
         if let Some(since) = self.recording_since.get() {
-            let s = since.elapsed().as_secs();
+            let paused = self.paused_total.get()
+                + self
+                    .paused_at
+                    .get()
+                    .map_or(Duration::ZERO, |at| at.elapsed());
+            let s = since.elapsed().saturating_sub(paused).as_secs();
             self.ui
                 .timer
                 .set_label(&format!("{:02}:{:02}", s / 60, s % 60));
@@ -1831,6 +1943,8 @@ fn build_ui(app: &adw::Application) -> Ui {
     let formats_menu = gio::Menu::new();
     let picture_menu = gio::Menu::new();
     picture_menu.append_submenu(Some("Format"), &formats_menu);
+    let mics_menu = gio::Menu::new();
+    picture_menu.append_submenu(Some("Microphone"), &mics_menu);
     picture_menu.append(Some("Grid"), Some("win.grid"));
     picture_menu.append(Some("Fullscreen"), Some("win.fullscreen"));
     menu.append_section(None, &picture_menu);
@@ -2196,6 +2310,29 @@ fn build_ui(app: &adw::Application) -> Ui {
     read_text.add_css_class("osd");
     read_text.add_css_class("circular");
     read_text.set_action_name(Some("win.read-text"));
+    let pause_button = gtk::ToggleButton::builder()
+        .icon_name("media-playback-pause-symbolic")
+        .tooltip_text("Pause Recording")
+        .action_name("win.pause")
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    pause_button.add_css_class("osd");
+    pause_button.add_css_class("circular");
+    let level = gtk::LevelBar::builder()
+        .min_value(0.0)
+        .max_value(1.0)
+        .width_request(72)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .tooltip_text("Microphone level")
+        .build();
+    level.add_offset_value(gtk::LEVEL_BAR_OFFSET_LOW, 0.5);
+    level.add_offset_value(gtk::LEVEL_BAR_OFFSET_HIGH, 0.85);
+    level.add_offset_value(gtk::LEVEL_BAR_OFFSET_FULL, 0.97);
+    level.add_css_class("mic-level");
+    right.append(&level);
+    right.append(&pause_button);
     right.append(&timer);
     right.append(&thumb_button);
     right.append(&read_text);
@@ -2262,6 +2399,9 @@ fn build_ui(app: &adw::Application) -> Ui {
         flash,
         toolbar,
         formats_menu,
+        mics_menu,
+        pause_button,
+        level,
         thumb_button,
         thumb_picture,
         gallery,
