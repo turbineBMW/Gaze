@@ -17,6 +17,13 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Scan Document to PDF (Ctrl+Shift+D): finds the page in front of the
+  camera, straightens it, and saves an A4 PDF to `~/Documents` with the
+  recognised text as a selectable layer.
+- Time-lapse recordings (menu: 5× to 120×) and Motion Capture
+  (Ctrl+Shift+M): a photo whenever something moves.
+- Keep Virtual Camera After Reboot (menu): installs a small system service
+  so the "Gaze" device exists at boot without a prompt.
 - Format (menu): pick the camera's size and frame rate; remembered per
   camera. Grid (Ctrl+G) and Fullscreen (F11).
 - Camera controls (Ctrl+Shift+K): whatever the driver exposes, as sliders,

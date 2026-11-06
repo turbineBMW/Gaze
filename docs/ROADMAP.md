@@ -86,16 +86,20 @@ ordered by value for effort; each one leaves the app working and shippable.
       Gaze is not focused, `app.quit` for scripts.
 - [ ] A compact always-on-top mirror mode (a Hyprland window rule does it
       today: `windowrule = pin, class:io.github.turbinebmw.Gaze`).
-- [ ] Live thumbnails in the effects picker; a modprobe snippet for a
-      permanent virtual camera device.
+- [x] Live thumbnails in the effects picker (a second small GL pipeline
+      while it is open).
+- [x] Keep Virtual Camera After Reboot: a oneshot system unit, installed
+      through pkexec, recreates the device at boot.
 
 ## Phase 7: Stretch
 
-- Document scan: find the page, perspective-correct, export PDF with a text
-  layer (pairs with Phase 3).
-- Time-lapse and GIF capture; motion-triggered capture.
-- Background blur or replacement (ONNX segmentation) and auto-framing from
-  face detection. These need a model runtime and are the heaviest items.
+- [x] Scan Document to PDF (Ctrl+Shift+D): the page is found, straightened
+      and saved as an A4 PDF with an invisible text layer from ocrs.
+- [x] Time-lapse recordings (5x to 120x) and motion-triggered capture.
+- [ ] GIF capture.
+- [ ] Background blur or replacement (ONNX segmentation through rten,
+      which Gaze already carries for ocrs). Auto-framing is the ISP relay's
+      job on the Surface.
 
 ## Also worth having
 
