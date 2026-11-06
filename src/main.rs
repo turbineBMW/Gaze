@@ -5,6 +5,7 @@ mod camera;
 mod codes;
 mod controls;
 mod gifcap;
+mod matte;
 mod motion;
 mod omarchy;
 mod scan;

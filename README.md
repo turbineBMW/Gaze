@@ -17,6 +17,14 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Blur Background (Ctrl+B): a person matte from Robust Video Matting (15 MB,
+  downloaded on first use) keeps you sharp and blurs the room, in photos,
+  recordings and the virtual camera too.
+- GIF mode next to Photo and Video: up to eight seconds, looping, saved
+  beside the photos.
+- `gaze --do shutter` (or `mode gif`, `effect twirl`, `background-blur`,
+  `quit`, any window action) drives a running Gaze from a script or a
+  Hyprland keybinding.
 - Scan Document to PDF (Ctrl+Shift+D): finds the page in front of the
   camera, straightens it, and saves an A4 PDF to `~/Documents` with the
   recognised text as a selectable layer.

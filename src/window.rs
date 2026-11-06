@@ -7,6 +7,7 @@ use crate::camera::{
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::controls;
 use crate::gifcap::{self, GifCapture};
+use crate::matte;
 use crate::motion;
 use crate::scan;
 use crate::settings::{Settings, LAPSES, TIMERS};
@@ -160,6 +161,9 @@ pub struct Window {
     lapse: Cell<u32>,
     /// The page found by Scan Document, outlined while it is processed.
     scan_quad: RefCell<Option<scan::Quad>>,
+    /// Background blur wanted (the setting) and being set up.
+    blur_on: Cell<bool>,
+    blur_starting: Cell<bool>,
     /// A GIF being captured, and since when.
     gif: RefCell<Option<GifCapture>>,
     gif_since: Cell<Option<Instant>>,
@@ -221,6 +225,8 @@ impl Window {
             motion_last_shot: Cell::new(None),
             lapse: Cell::new(settings.lapse),
             scan_quad: RefCell::new(None),
+            blur_on: Cell::new(settings.background_blur),
+            blur_starting: Cell::new(false),
             gif: RefCell::new(None),
             gif_since: Cell::new(None),
             previews: RefCell::new(None),
@@ -711,6 +717,20 @@ impl Window {
         window.add_action(&gallery);
         app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
 
+        // Blur the background behind the person.
+        let blur = gio::SimpleAction::new_stateful(
+            "background-blur",
+            None,
+            &self.blur_on.get().to_variant(),
+        );
+        blur.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.set_background_blur(!this.blur_on.get())
+        ));
+        window.add_action(&blur);
+        app.set_accels_for_action("win.background-blur", &["<Control>b"]);
+
         // Scan the page in front of the camera to a PDF.
         let scan_doc = gio::SimpleAction::new("scan-document", None);
         scan_doc.connect_activate(glib::clone!(
@@ -1129,6 +1149,9 @@ impl Window {
                 self.apply_effect_state();
                 if self.virtual_on.get() {
                     self.start_virtual_camera();
+                }
+                if self.blur_on.get() {
+                    self.start_background_blur();
                 }
                 self.ui.stack.set_visible_child_name("viewfinder");
                 self.update_shutter();
@@ -1765,6 +1788,65 @@ impl Window {
             chip.set_size_request((w * vw) as i32, (h * vh) as i32);
             self.ui.text_layer.move_(chip, vx + x * vw, vy + y * vh);
         }
+    }
+
+    /// Turn background blur on (fetching the model the first time) or off,
+    /// and remember the choice.
+    fn set_background_blur(self: &Rc<Self>, on: bool) {
+        self.blur_on.set(on);
+        self.settings.borrow_mut().background_blur = on;
+        self.settings.borrow().save();
+        if let Some(action) = self.ui.window.lookup_action("background-blur") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&on.to_variant());
+            }
+        }
+        if on {
+            self.start_background_blur();
+        } else if let Some(camera) = self.camera.borrow().as_ref() {
+            if let Err(error) = camera.set_background_blur(false) {
+                log::warn!("{error}");
+            }
+        }
+    }
+
+    fn start_background_blur(self: &Rc<Self>) {
+        if self.blur_starting.get() {
+            return;
+        }
+        if self
+            .camera
+            .borrow()
+            .as_ref()
+            .is_none_or(Camera::background_blur)
+        {
+            return;
+        }
+        self.blur_starting.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let result = async {
+                if !matte::model_ready() {
+                    this.ui.toasts.add_toast(adw::Toast::new(&format!(
+                        "Downloading the background matting model ({})…",
+                        matte::MODEL_SIZE
+                    )));
+                    matte::download_model().await?;
+                }
+                if !this.blur_on.get() {
+                    return Ok(());
+                }
+                let camera = this.camera.borrow();
+                let camera = camera.as_ref().ok_or("no camera")?;
+                camera.set_background_blur(true)
+            }
+            .await;
+            this.blur_starting.set(false);
+            if let Err(error) = result {
+                this.ui.toasts.add_toast(adw::Toast::new(&error));
+                this.set_background_blur(false);
+            }
+        });
     }
 
     /// Turn the virtual camera on (creating the device if needed) or off,
@@ -2564,6 +2646,7 @@ fn build_ui(app: &adw::Application) -> Ui {
     menu.append_section(None, &picture_menu);
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
+    view.append(Some("Blur Background"), Some("win.background-blur"));
     view.append(Some("Scan Codes"), Some("win.scan"));
     view.append(Some("Motion Capture"), Some("win.motion"));
     view.append(Some("Scan Document to PDF"), Some("win.scan-document"));

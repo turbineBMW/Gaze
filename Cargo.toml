@@ -19,6 +19,7 @@ ocrs = "0.13.1"
 rten = "0.26"
 libc = "0.2"
 gif = "0.14.2"
+rten-tensor = "0.26"
 
 [dev-dependencies]
 tempfile = "3"

@@ -492,6 +492,7 @@ dependencies = [
  "log",
  "ocrs",
  "rten",
+ "rten-tensor",
  "rxing",
  "tempfile",
 ]
