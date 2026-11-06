@@ -35,6 +35,123 @@ use std::sync::{Arc, Mutex};
 pub struct CameraInfo {
     pub name: String,
     source: Source,
+    /// The raw formats the camera offers, largest and fastest first.
+    pub formats: Vec<Format>,
+}
+
+/// A size and frame rate a camera can deliver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub width: i32,
+    pub height: i32,
+    pub fps: Option<gst::Fraction>,
+}
+
+impl Format {
+    /// A stable id for menus and the settings file: `1920x1080@30/1`.
+    pub fn id(&self) -> String {
+        match self.fps {
+            Some(fps) => format!(
+                "{}x{}@{}/{}",
+                self.width,
+                self.height,
+                fps.numer(),
+                fps.denom()
+            ),
+            None => format!("{}x{}", self.width, self.height),
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Format> {
+        let (size, fps) = match id.split_once('@') {
+            Some((size, fps)) => (size, Some(fps)),
+            None => (id, None),
+        };
+        let (w, h) = size.split_once('x')?;
+        let fps = match fps {
+            Some(fps) => {
+                let (n, d) = fps.split_once('/').unwrap_or((fps, "1"));
+                Some(gst::Fraction::new(n.parse().ok()?, d.parse().ok()?))
+            }
+            None => None,
+        };
+        Some(Format {
+            width: w.parse().ok()?,
+            height: h.parse().ok()?,
+            fps,
+        })
+    }
+
+    /// For people: `1920 × 1080 · 30 fps`.
+    pub fn label(&self) -> String {
+        let size = format!("{} × {}", self.width, self.height);
+        match self.fps {
+            Some(fps) if fps.denom() != 0 => {
+                let rate = fps.numer() as f64 / fps.denom() as f64;
+                if (rate - rate.round()).abs() < 0.01 {
+                    format!("{size} · {} fps", rate.round() as i64)
+                } else {
+                    format!("{size} · {rate:.2} fps")
+                }
+            }
+            _ => size,
+        }
+    }
+
+    fn pixels(&self) -> i64 {
+        self.width as i64 * self.height as i64
+    }
+
+    fn rate(&self) -> f64 {
+        self.fps
+            .filter(|f| f.denom() != 0)
+            .map_or(0.0, |f| f.numer() as f64 / f.denom() as f64)
+    }
+}
+
+/// The fixed raw formats in a device's caps, deduplicated, largest and
+/// fastest first. Frame-rate lists are expanded; ranges contribute their
+/// top.
+fn formats_from_caps(caps: &gst::Caps) -> Vec<Format> {
+    let mut formats: Vec<Format> = Vec::new();
+    for structure in caps.iter() {
+        if structure.name() != "video/x-raw" {
+            continue;
+        }
+        let (Ok(width), Ok(height)) = (
+            structure.get::<i32>("width"),
+            structure.get::<i32>("height"),
+        ) else {
+            continue;
+        };
+        let mut rates: Vec<Option<gst::Fraction>> = Vec::new();
+        if let Ok(fps) = structure.get::<gst::Fraction>("framerate") {
+            rates.push(Some(fps));
+        } else if let Ok(list) = structure.get::<gst::List>("framerate") {
+            rates.extend(
+                list.iter()
+                    .filter_map(|v| v.get::<gst::Fraction>().ok().map(Some)),
+            );
+        } else if let Ok(range) = structure.get::<gst::FractionRange>("framerate") {
+            rates.push(Some(range.max()));
+        } else {
+            rates.push(None);
+        }
+        for fps in rates {
+            let format = Format { width, height, fps };
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
+    formats.sort_by(|a, b| {
+        b.pixels().cmp(&a.pixels()).then(
+            b.rate()
+                .partial_cmp(&a.rate())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    formats
 }
 
 enum Source {
@@ -73,6 +190,10 @@ pub fn list() -> Vec<CameraInfo> {
         if name == crate::vcam::LABEL {
             continue;
         }
+        let formats = device
+            .caps()
+            .map(|c| formats_from_caps(&c))
+            .unwrap_or_default();
         match (api.as_str(), path) {
             ("v4l2", Some(path)) => {
                 if !seen.contains(&path) {
@@ -80,12 +201,14 @@ pub fn list() -> Vec<CameraInfo> {
                     v4l2.push(CameraInfo {
                         name,
                         source: Source::V4l2(path),
+                        formats,
                     });
                 }
             }
             _ => other.push(CameraInfo {
                 name,
                 source: Source::Device(device),
+                formats,
             }),
         }
     }
@@ -235,7 +358,11 @@ fn make(factory: &str) -> Result<gst::Element, String> {
 impl Camera {
     /// Build the pipeline for `info` and start it. `on_event` runs on the
     /// main loop.
-    pub fn open(info: &CameraInfo, on_event: impl Fn(Event) + 'static) -> Result<Self, String> {
+    pub fn open(
+        info: &CameraInfo,
+        format: Option<&Format>,
+        on_event: impl Fn(Event) + 'static,
+    ) -> Result<Self, String> {
         let pipeline = gst::Pipeline::with_name("gaze");
         let source = match &info.source {
             Source::V4l2(path) => {
@@ -247,10 +374,23 @@ impl Camera {
                 .create_element(Some("source"))
                 .map_err(|e| format!("cannot open {}: {e}", info.name))?,
         };
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("width", gst::IntRange::new(1, 1920))
-            .field("height", gst::IntRange::new(1, 1080))
-            .build();
+        // A chosen format exactly; otherwise anything up to 1080p and the
+        // driver's pick.
+        let caps = match format {
+            Some(f) => {
+                let mut caps = gst::Caps::builder("video/x-raw")
+                    .field("width", f.width)
+                    .field("height", f.height);
+                if let Some(fps) = f.fps {
+                    caps = caps.field("framerate", fps);
+                }
+                caps.build()
+            }
+            None => gst::Caps::builder("video/x-raw")
+                .field("width", gst::IntRange::new(1, 1920))
+                .field("height", gst::IntRange::new(1, 1080))
+                .build(),
+        };
         let filter = make("capsfilter")?;
         filter.set_property("caps", &caps);
         let effect = make("identity")?;
@@ -773,4 +913,49 @@ fn save_jpeg(sample: &gst::Sample, path: &Path) -> Result<(), String> {
     pixbuf
         .savev(path, "jpeg", &[("quality", "95")])
         .map_err(|e| format!("cannot save {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn format_ids_round_trip() {
+        let f = Format {
+            width: 1280,
+            height: 720,
+            fps: Some(gst::Fraction::new(30000, 1001)),
+        };
+        assert_eq!(f.id(), "1280x720@30000/1001");
+        assert_eq!(Format::parse(&f.id()), Some(f.clone()));
+        assert_eq!(f.label(), "1280 × 720 · 29.97 fps");
+        let plain = Format::parse("640x480").unwrap();
+        assert_eq!(plain.fps, None);
+        assert_eq!(plain.label(), "640 × 480");
+        assert_eq!(Format::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn formats_from_caps_expand_and_sort() {
+        gst::init().unwrap();
+        let caps = gst::Caps::from_str(
+            "video/x-raw, width=640, height=480, framerate={ 15/1, 30/1 }; \
+             video/x-raw, width=1920, height=1080, framerate=30/1; \
+             video/x-raw, width=1920, height=1080, framerate=30/1; \
+             image/jpeg, width=3840, height=2160, framerate=30/1; \
+             video/x-raw, width=1280, height=720, framerate=[ 1/1, 60/1 ]",
+        )
+        .unwrap();
+        let labels: Vec<String> = formats_from_caps(&caps).iter().map(Format::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "1920 × 1080 · 30 fps",
+                "1280 × 720 · 60 fps",
+                "640 × 480 · 30 fps",
+                "640 × 480 · 15 fps",
+            ]
+        );
+    }
 }

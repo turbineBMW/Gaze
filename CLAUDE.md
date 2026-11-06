@@ -67,3 +67,7 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
 - Window actions are on D-Bus at `/io/github/turbinebmw/Gaze/window/1`
   (`org.gtk.Actions.Activate`), handy for scripted tests:
   `gdbus call --session --dest io.github.turbinebmw.Gaze --object-path /io/github/turbinebmw/Gaze/window/1 --method org.gtk.Actions.Activate shutter [] {}`
+- Never `pkill gaze` while it streams the Surface front camera: the ISP relay
+  behind `/dev/video40` does not recover from an abrupt close and needs
+  `systemctl restart v4l2-relayd@sp12-front`. Quit cleanly instead:
+  `gdbus call --session --dest io.github.turbinebmw.Gaze --object-path /io/github/turbinebmw/Gaze --method org.gtk.Actions.Activate quit [] {}`

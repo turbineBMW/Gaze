@@ -86,6 +86,22 @@ fn main() -> glib::ExitCode {
     glib::set_application_name("Gaze");
     let app = adw::Application::builder().application_id(APP_ID).build();
     let state: Rc<RefCell<AppState>> = Rc::default();
+    // app.quit closes the window the proper way (the camera is released
+    // first), for scripts and the D-Bus action interface.
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    quit.connect_activate(glib::clone!(
+        #[weak]
+        app,
+        move |_, _| {
+            if let Some(window) = app.active_window() {
+                window.close();
+            } else {
+                app.quit();
+            }
+        }
+    ));
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
     app.connect_activate(move |app| {
         if let Some(window) = app.active_window() {
             window.present();

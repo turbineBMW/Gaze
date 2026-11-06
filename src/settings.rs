@@ -13,6 +13,10 @@ pub struct Settings {
     pub timer: u32,
     /// Feed the virtual camera whenever a camera is open.
     pub virtual_camera: bool,
+    /// Rule-of-thirds grid over the picture.
+    pub grid: bool,
+    /// Chosen format per camera name, as `Format::id` strings.
+    pub formats: Vec<(String, String)>,
 }
 
 /// The self-timer lengths offered, in seconds.
@@ -29,6 +33,8 @@ impl Settings {
             mirror: true,
             timer: 0,
             virtual_camera: false,
+            grid: false,
+            formats: Vec::new(),
         };
         let Ok(text) = std::fs::read_to_string(path()) else {
             return settings;
@@ -38,6 +44,10 @@ impl Settings {
                 Some(("camera", v)) if !v.is_empty() => settings.camera = Some(v.to_string()),
                 Some(("mirror", v)) => settings.mirror = v.trim() == "true",
                 Some(("virtual_camera", v)) => settings.virtual_camera = v.trim() == "true",
+                Some(("grid", v)) => settings.grid = v.trim() == "true",
+                Some((key, v)) if key.starts_with("format.") && !v.trim().is_empty() => {
+                    settings.set_format(&key["format.".len()..], Some(v.trim()));
+                }
                 Some(("timer", v)) => {
                     if let Ok(t) = v.trim().parse::<u32>() {
                         if TIMERS.contains(&t) {
@@ -51,18 +61,37 @@ impl Settings {
         settings
     }
 
+    pub fn format_for(&self, camera: &str) -> Option<&str> {
+        self.formats
+            .iter()
+            .find(|(c, _)| c == camera)
+            .map(|(_, f)| f.as_str())
+    }
+
+    /// Remember (or with `None`, forget) the format for a camera.
+    pub fn set_format(&mut self, camera: &str, format: Option<&str>) {
+        self.formats.retain(|(c, _)| c != camera);
+        if let Some(format) = format {
+            self.formats.push((camera.to_string(), format.to_string()));
+        }
+    }
+
     pub fn save(&self) {
         let path = path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = format!(
-            "camera={}\nmirror={}\ntimer={}\nvirtual_camera={}\n",
+        let mut text = format!(
+            "camera={}\nmirror={}\ntimer={}\nvirtual_camera={}\ngrid={}\n",
             self.camera.as_deref().unwrap_or(""),
             self.mirror,
             self.timer,
-            self.virtual_camera
+            self.virtual_camera,
+            self.grid
         );
+        for (camera, format) in &self.formats {
+            text.push_str(&format!("format.{camera}={format}\n"));
+        }
         if let Err(error) = std::fs::write(&path, text) {
             log::warn!("cannot save {}: {error}", path.display());
         }

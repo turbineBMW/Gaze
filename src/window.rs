@@ -1,7 +1,9 @@
 //! The main window: viewfinder, shutter, camera picker, the colour
 //! statistics card and the code scanner's card.
 
-use crate::camera::{self, Camera, CameraInfo, Effect, Event, LatestFrame, Tap, TapId, EFFECTS};
+use crate::camera::{
+    self, Camera, CameraInfo, Effect, Event, Format, LatestFrame, Tap, TapId, EFFECTS,
+};
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
@@ -48,6 +50,9 @@ struct Ui {
     mode_toggle: adw::ToggleGroup,
     timer: gtk::Label,
     flash: gtk::Box,
+    toolbar: adw::ToolbarView,
+    /// The Format submenu, refilled for each camera.
+    formats_menu: gio::Menu,
 }
 
 pub struct Window {
@@ -84,6 +89,7 @@ pub struct Window {
     /// The virtual camera: wanted (the setting) and being set up.
     virtual_on: Cell<bool>,
     virtual_starting: Cell<bool>,
+    grid: Cell<bool>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -123,6 +129,7 @@ impl Window {
             reading: Cell::new(false),
             virtual_on: Cell::new(settings.virtual_camera),
             virtual_starting: Cell::new(false),
+            grid: Cell::new(settings.grid),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -276,6 +283,18 @@ impl Window {
                     }
                 }
                 drop(codes);
+                if this.grid.get() {
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
+                    cr.set_line_width(1.0);
+                    for i in 1..3 {
+                        let f = i as f64 / 3.0;
+                        cr.move_to(vx + f * vw, vy);
+                        cr.line_to(vx + f * vw, vy + vh);
+                        cr.move_to(vx, vy + f * vh);
+                        cr.line_to(vx + vw, vy + f * vh);
+                    }
+                    let _ = cr.stroke();
+                }
                 if !this.stats_on.get() {
                     return;
                 }
@@ -547,18 +566,90 @@ impl Window {
         window.add_action(&cycle);
         app.set_accels_for_action("win.cycle-timer", &["<Control>t"]);
 
-        // Escape stops a countdown.
+        // Escape stops a countdown, leaves text mode, leaves fullscreen.
         let cancel = gio::SimpleAction::new("cancel", None);
         cancel.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move |_, _| {
-                this.cancel_countdown();
-                this.unfreeze();
+                if this.counting_down() {
+                    this.cancel_countdown();
+                } else if this.frozen.get() || this.reading.get() {
+                    this.unfreeze();
+                } else if this.ui.window.is_fullscreen() {
+                    this.ui.window.unfullscreen();
+                }
             }
         ));
         window.add_action(&cancel);
         app.set_accels_for_action("win.cancel", &["Escape"]);
+
+        // The camera's format: "auto" or a Format id, remembered per camera.
+        let format = gio::SimpleAction::new_stateful(
+            "format",
+            Some(glib::VariantTy::STRING),
+            &"auto".to_variant(),
+        );
+        format.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                let id = value.and_then(|v| v.str()).unwrap_or("auto");
+                let Some(name) = this.current_camera_name() else {
+                    return;
+                };
+                let chosen = Some(id).filter(|id| *id != "auto");
+                this.settings.borrow_mut().set_format(&name, chosen);
+                this.settings.borrow().save();
+                this.open_selected();
+            }
+        ));
+        window.add_action(&format);
+
+        let grid = gio::SimpleAction::new_stateful("grid", None, &self.grid.get().to_variant());
+        grid.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let on = !this.grid.get();
+                this.grid.set(on);
+                action.set_state(&on.to_variant());
+                this.settings.borrow_mut().grid = on;
+                this.settings.borrow().save();
+                this.ui.overlay.queue_draw();
+            }
+        ));
+        window.add_action(&grid);
+        app.set_accels_for_action("win.grid", &["<Control>g"]);
+
+        let fullscreen = gio::SimpleAction::new_stateful("fullscreen", None, &false.to_variant());
+        fullscreen.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                if this.ui.window.is_fullscreen() {
+                    this.ui.window.unfullscreen();
+                } else {
+                    this.ui.window.fullscreen();
+                }
+            }
+        ));
+        window.add_action(&fullscreen);
+        app.set_accels_for_action("win.fullscreen", &["F11"]);
+        // The header bar goes with the window chrome.
+        window.connect_fullscreened_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |window| {
+                let full = window.is_fullscreen();
+                this.ui.toolbar.set_reveal_top_bars(!full);
+                if let Some(action) = window.lookup_action("fullscreen") {
+                    if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                        action.set_state(&full.to_variant());
+                    }
+                }
+            }
+        ));
 
         for (name, dir) in [("open-photos", photos_dir()), ("open-videos", videos_dir())] {
             let action = gio::SimpleAction::new(name, None);
@@ -594,7 +685,7 @@ impl Window {
             }
         ));
         window.add_action(&about);
-        app.set_accels_for_action("window.close", &["<Control>w", "<Control>q"]);
+        app.set_accels_for_action("window.close", &["<Control>w"]);
     }
 
     fn refresh_cameras(self: &Rc<Self>) {
@@ -653,15 +744,26 @@ impl Window {
         let Some(info) = cameras.get(index) else {
             return;
         };
+        let format = self
+            .settings
+            .borrow()
+            .format_for(&info.name)
+            .and_then(Format::parse)
+            .filter(|f| info.formats.contains(f));
+        self.fill_formats_menu(info, format.as_ref());
         let weak = Rc::downgrade(self);
-        match Camera::open(info, move |event| {
+        match Camera::open(info, format.as_ref(), move |event| {
             if let Some(this) = weak.upgrade() {
                 this.on_event(event);
             }
         }) {
             Ok(camera) => {
                 let paintable = camera.paintable();
-                log::info!("opened {}", info.name);
+                log::info!(
+                    "opened {} ({})",
+                    info.name,
+                    format.as_ref().map_or("auto".into(), Format::label)
+                );
                 self.ui.picture.set_paintable(Some(&paintable));
                 self.stats_tap.set(None);
                 self.scanner.replace(None);
@@ -680,6 +782,32 @@ impl Window {
                 self.update_shutter();
             }
             Err(error) => self.show_status("Camera Unavailable", &error),
+        }
+    }
+
+    fn current_camera_name(&self) -> Option<String> {
+        let index = self.ui.cameras_dropdown.selected() as usize;
+        self.cameras.borrow().get(index).map(|c| c.name.clone())
+    }
+
+    /// The Format submenu for this camera: Automatic plus each format it
+    /// offers, as radio items over win.format.
+    fn fill_formats_menu(&self, info: &CameraInfo, chosen: Option<&Format>) {
+        let menu = &self.ui.formats_menu;
+        menu.remove_all();
+        let item = gio::MenuItem::new(Some("Automatic"), None);
+        item.set_action_and_target_value(Some("win.format"), Some(&"auto".to_variant()));
+        menu.append_item(&item);
+        for format in &info.formats {
+            let item = gio::MenuItem::new(Some(&format.label()), None);
+            item.set_action_and_target_value(Some("win.format"), Some(&format.id().to_variant()));
+            menu.append_item(&item);
+        }
+        if let Some(action) = self.ui.window.lookup_action("format") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                let state = chosen.map_or("auto".to_string(), Format::id);
+                action.set_state(&state.to_variant());
+            }
         }
     }
 
@@ -1448,6 +1576,12 @@ impl Window {
 fn build_ui(app: &adw::Application) -> Ui {
     let cameras_dropdown = gtk::DropDown::builder().tooltip_text("Camera").build();
     let menu = gio::Menu::new();
+    let formats_menu = gio::Menu::new();
+    let picture_menu = gio::Menu::new();
+    picture_menu.append_submenu(Some("Format"), &formats_menu);
+    picture_menu.append(Some("Grid"), Some("win.grid"));
+    picture_menu.append(Some("Fullscreen"), Some("win.fullscreen"));
+    menu.append_section(None, &picture_menu);
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
     view.append(Some("Scan Codes"), Some("win.scan"));
@@ -1805,6 +1939,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         mode_toggle,
         timer,
         flash,
+        toolbar,
+        formats_menu,
     }
 }
 
