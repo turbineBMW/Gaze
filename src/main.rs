@@ -6,6 +6,7 @@ mod codes;
 mod omarchy;
 mod settings;
 mod stats;
+mod text;
 mod theme;
 mod window;
 
@@ -33,6 +34,13 @@ label.countdown {
 }
 menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
 popover.effects button { min-width: 92px; }
+button.text-chip {
+  min-height: 0; padding: 0 6px; border-radius: 6px;
+  background-color: rgb(0 0 0 / 55%); color: white;
+  border: 1px solid rgb(255 255 255 / 40%);
+}
+button.text-chip:hover { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
+button.text-chip label { font-size: 12px; }
 popover.effects button:checked { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
 /* Toasts sit above the shutter row instead of on it. */
 toast { margin-bottom: 100px; }

@@ -21,6 +21,10 @@ range, which makes everything look grey and flat; Gaze does not.
   Eye, Twirl, Bulge, Square, Sepia, X-Pro, Thermal, X-Ray, Glow, Blur, Edges,
   Red Only. They are rendered on the GPU and go into photos and recordings
   too. Ctrl+0 goes back to normal.
+- Read Text (Ctrl+Shift+T): freezes the picture and puts a chip over every
+  line of text it finds; click a chip to copy that line, or Copy All. The
+  recognition models (12 MB, pure Rust `ocrs`) are downloaded on first use
+  into `~/.cache/gaze/ocrs`.
 - Scan Codes (Ctrl+S): QR codes and barcodes are outlined as they are seen,
   and a card offers what fits the payload: open a link, join a Wi-Fi
   network, save a contact or event, copy the text.
