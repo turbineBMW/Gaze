@@ -643,18 +643,34 @@ impl Camera {
         }
     }
 
-    /// Save the frame on screen as a JPEG. Runs the conversion and encoding
-    /// off the main loop.
+    /// Save the frame on screen as a JPEG, and make a small RGB copy of it
+    /// for the gallery. Runs the conversion and encoding off the main loop.
     pub fn take_photo(
         &self,
         path: PathBuf,
-    ) -> impl std::future::Future<Output = Result<PathBuf, String>> + 'static {
+    ) -> impl std::future::Future<Output = Result<(PathBuf, Option<Frame>), String>> + 'static {
         let sample = self.preview.property::<Option<gst::Sample>>("last-sample");
         async move {
             let sample = sample.ok_or("no frame yet")?;
-            gio::spawn_blocking(move || save_jpeg(&sample, &path).map(|_| path))
+            gio::spawn_blocking(move || {
+                save_jpeg(&sample, &path)?;
+                Ok((path, thumbnail(&sample, THUMBNAIL_WIDTH)))
+            })
+            .await
+            .map_err(|_| "photo thread failed".to_string())?
+        }
+    }
+
+    /// A small RGB copy of the frame on screen (for a recording's gallery
+    /// entry).
+    pub fn snapshot(&self) -> impl std::future::Future<Output = Option<Frame>> + 'static {
+        let sample = self.preview.property::<Option<gst::Sample>>("last-sample");
+        async move {
+            let sample = sample?;
+            gio::spawn_blocking(move || thumbnail(&sample, THUMBNAIL_WIDTH))
                 .await
-                .map_err(|_| "photo thread failed".to_string())?
+                .ok()
+                .flatten()
         }
     }
 
@@ -882,6 +898,29 @@ fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
         height: info.height() as usize,
         stride: info.stride()[0] as usize,
     })
+}
+
+pub const THUMBNAIL_WIDTH: i32 = 320;
+
+/// The sample scaled to `width` pixels wide, packed RGB.
+fn thumbnail(sample: &gst::Sample, width: i32) -> Option<Frame> {
+    let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
+    if info.width() == 0 {
+        return None;
+    }
+    let height = ((width as i64 * info.height() as i64 / info.width() as i64) & !1).max(2);
+    let small = gst_video::convert_sample(
+        sample,
+        &gst::Caps::builder("video/x-raw")
+            .field("format", "RGB")
+            .field("width", width)
+            .field("height", height as i32)
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build(),
+        Some(gst::ClockTime::from_seconds(5)),
+    )
+    .ok()?;
+    frame_from_sample(&small)
 }
 
 fn save_jpeg(sample: &gst::Sample, path: &Path) -> Result<(), String> {
