@@ -4,6 +4,7 @@
 mod camera;
 mod codes;
 mod controls;
+mod motion;
 mod omarchy;
 mod settings;
 mod stats;

@@ -6,7 +6,8 @@ use crate::camera::{
 };
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::controls;
-use crate::settings::{Settings, TIMERS};
+use crate::motion;
+use crate::settings::{Settings, LAPSES, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
 use crate::vcam;
@@ -123,6 +124,14 @@ pub struct Window {
     paused_at: Cell<Option<Instant>>,
     /// The open camera's V4L2 node, for its controls.
     device_path: RefCell<Option<PathBuf>>,
+    /// Motion-triggered capture: on, its tap, the frames, the last one
+    /// compared, and when the last photo was taken.
+    motion_on: Cell<bool>,
+    motion_tap: Cell<Option<TapId>>,
+    motion_frames: LatestFrame,
+    motion_prev: RefCell<Option<camera::Frame>>,
+    motion_last_shot: Cell<Option<Instant>>,
+    lapse: Cell<u32>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -170,6 +179,12 @@ impl Window {
             paused_total: Cell::new(Duration::ZERO),
             paused_at: Cell::new(None),
             device_path: RefCell::new(None),
+            motion_on: Cell::new(false),
+            motion_tap: Cell::new(None),
+            motion_frames: LatestFrame::default(),
+            motion_prev: RefCell::new(None),
+            motion_last_shot: Cell::new(None),
+            lapse: Cell::new(settings.lapse),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -702,6 +717,52 @@ impl Window {
         window.add_action(&cancel);
         app.set_accels_for_action("win.cancel", &["Escape"]);
 
+        // Motion-triggered photos.
+        let motion = gio::SimpleAction::new_stateful("motion", None, &false.to_variant());
+        motion.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let on = !this.motion_on.get();
+                this.motion_on.set(on);
+                action.set_state(&on.to_variant());
+                this.motion_prev.replace(None);
+                this.sync_motion_tap();
+                this.ui.toasts.add_toast(adw::Toast::new(if on {
+                    "Motion capture on: a photo whenever something moves"
+                } else {
+                    "Motion capture off"
+                }));
+            }
+        ));
+        window.add_action(&motion);
+        app.set_accels_for_action("win.motion", &["<Control><Shift>m"]);
+
+        // Time-lapse speed for recordings, as a string for the menu.
+        let lapse = gio::SimpleAction::new_stateful(
+            "lapse",
+            Some(glib::VariantTy::STRING),
+            &self.lapse.get().to_string().to_variant(),
+        );
+        lapse.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, value| {
+                let Some(speed) = value
+                    .and_then(|v| v.str())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|s| LAPSES.contains(s))
+                else {
+                    return;
+                };
+                this.lapse.set(speed);
+                action.set_state(&speed.to_string().to_variant());
+                this.settings.borrow_mut().lapse = speed;
+                this.settings.borrow().save();
+            }
+        ));
+        window.add_action(&lapse);
+
         // Pause and resume the recording.
         let pause = gio::SimpleAction::new_stateful("pause", None, &false.to_variant());
         pause.connect_activate(glib::clone!(
@@ -921,6 +982,7 @@ impl Window {
                 );
                 self.ui.picture.set_paintable(Some(&paintable));
                 self.stats_tap.set(None);
+                self.motion_tap.set(None);
                 self.scanner.replace(None);
                 if let Err(error) = camera.set_effect(self.effect.get()) {
                     log::warn!("{error}");
@@ -928,6 +990,7 @@ impl Window {
                 }
                 self.camera.replace(Some(camera));
                 self.sync_stats_tap();
+                self.sync_motion_tap();
                 self.sync_scanner();
                 self.apply_effect_state();
                 if self.virtual_on.get() {
@@ -1548,6 +1611,84 @@ impl Window {
         });
     }
 
+    /// Take a photo of the frame on screen and file it.
+    fn snap_photo(self: &Rc<Self>, title: &'static str) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            return;
+        };
+        let path = photos_dir().join(format!("Gaze {}.jpg", timestamp()));
+        self.flash();
+        let this = self.clone();
+        let photo = camera.take_photo(path);
+        glib::spawn_future_local(async move {
+            match photo.await {
+                Ok((path, thumb)) => {
+                    this.add_capture(path.clone(), thumb, false);
+                    this.notify_capture(title, &path);
+                    this.toast_file(title, path);
+                }
+                Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not save the photo: {error}"
+                ))),
+            }
+        });
+    }
+
+    /// Tap the open camera for motion detection exactly while it is on.
+    fn sync_motion_tap(&self) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            self.motion_tap.set(None);
+            return;
+        };
+        match (self.motion_on.get(), self.motion_tap.get()) {
+            (true, None) => {
+                let frames = self.motion_frames.clone();
+                let tap = Tap {
+                    max_width: Some(320),
+                    fps: 5,
+                };
+                let id = camera.add_tap(tap, move |frame| frames.store(frame));
+                self.motion_tap.set(Some(id));
+            }
+            (false, Some(id)) => {
+                camera.remove_tap(id);
+                self.motion_tap.set(None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Compare the newest motion frame with the last one; a photo when
+    /// enough changed, at most one every few seconds.
+    fn check_motion(self: &Rc<Self>) {
+        let Some(frame) = self.motion_frames.take() else {
+            return;
+        };
+        let moved = self
+            .motion_prev
+            .borrow()
+            .as_ref()
+            .map_or(0.0, |prev| motion::changed(prev, &frame));
+        self.motion_prev.replace(Some(frame));
+        let cooling = self
+            .motion_last_shot
+            .get()
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+        let busy = self.counting_down()
+            || self.frozen.get()
+            || self
+                .camera
+                .borrow()
+                .as_ref()
+                .is_some_and(Camera::is_recording);
+        if moved >= motion::MOTION && !cooling && !busy {
+            self.motion_last_shot.set(Some(Instant::now()));
+            self.snap_photo("Motion: photo saved");
+        }
+    }
+
     /// Remember a capture: the thumbnail button shows it and the gallery
     /// lists it.
     fn add_capture(&self, path: PathBuf, thumb: Option<camera::Frame>, video: bool) {
@@ -1866,24 +2007,7 @@ impl Window {
             return;
         };
         match self.mode.get() {
-            Mode::Photo => {
-                let path = photos_dir().join(format!("Gaze {}.jpg", timestamp()));
-                self.flash();
-                let this = self.clone();
-                let photo = camera.take_photo(path);
-                glib::spawn_future_local(async move {
-                    match photo.await {
-                        Ok((path, thumb)) => {
-                            this.add_capture(path.clone(), thumb, false);
-                            this.notify_capture("Photo saved", &path);
-                            this.toast_file("Photo saved", path);
-                        }
-                        Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&format!(
-                            "Could not save the photo: {error}"
-                        ))),
-                    }
-                });
-            }
+            Mode::Photo => self.snap_photo("Photo saved"),
             Mode::Video => {
                 if camera.is_recording() {
                     if self.recording_since.get().is_some() {
@@ -1900,7 +2024,7 @@ impl Window {
                         return;
                     }
                     let mic = self.settings.borrow().mic.clone();
-                    match camera.start_recording(&path, mic.as_deref()) {
+                    match camera.start_recording(&path, mic.as_deref(), self.lapse.get()) {
                         Ok(()) => {
                             self.recording_since.set(Some(Instant::now()));
                             self.paused_total.set(Duration::ZERO);
@@ -1975,7 +2099,7 @@ impl Window {
         adw::TimedAnimation::new(flash, 0.8, 0.0, 250, target).play();
     }
 
-    fn tick(&self) {
+    fn tick(self: &Rc<Self>) {
         if let Some(since) = self.recording_since.get() {
             let paused = self.paused_total.get()
                 + self
@@ -1983,9 +2107,15 @@ impl Window {
                     .get()
                     .map_or(Duration::ZERO, |at| at.elapsed());
             let s = since.elapsed().saturating_sub(paused).as_secs();
-            self.ui
-                .timer
-                .set_label(&format!("{:02}:{:02}", s / 60, s % 60));
+            let lapse = self.lapse.get();
+            self.ui.timer.set_label(&if lapse > 1 {
+                format!("{lapse}× {:02}:{:02}", s / 60, s % 60)
+            } else {
+                format!("{:02}:{:02}", s / 60, s % 60)
+            });
+        }
+        if self.motion_on.get() {
+            self.check_motion();
         }
         if !self.stats_on.get() {
             return;
@@ -2084,12 +2214,25 @@ fn build_ui(app: &adw::Application) -> Ui {
     picture_menu.append_submenu(Some("Format"), &formats_menu);
     let mics_menu = gio::Menu::new();
     picture_menu.append_submenu(Some("Microphone"), &mics_menu);
+    let lapse_menu = gio::Menu::new();
+    for speed in LAPSES {
+        let label = if speed == 1 {
+            "Off".to_string()
+        } else {
+            format!("{speed}× faster")
+        };
+        let item = gio::MenuItem::new(Some(&label), None);
+        item.set_action_and_target_value(Some("win.lapse"), Some(&speed.to_string().to_variant()));
+        lapse_menu.append_item(&item);
+    }
+    picture_menu.append_submenu(Some("Time-lapse"), &lapse_menu);
     picture_menu.append(Some("Grid"), Some("win.grid"));
     picture_menu.append(Some("Fullscreen"), Some("win.fullscreen"));
     menu.append_section(None, &picture_menu);
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
     view.append(Some("Scan Codes"), Some("win.scan"));
+    view.append(Some("Motion Capture"), Some("win.motion"));
     view.append(Some("Virtual Camera"), Some("win.virtual-camera"));
     view.append(Some("Colour Statistics"), Some("win.stats"));
     menu.append_section(None, &view);
