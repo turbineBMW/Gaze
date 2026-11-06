@@ -7,6 +7,7 @@ use crate::camera::{
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::controls;
 use crate::motion;
+use crate::scan;
 use crate::settings::{Settings, LAPSES, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
@@ -136,6 +137,8 @@ pub struct Window {
     motion_prev: RefCell<Option<camera::Frame>>,
     motion_last_shot: Cell<Option<Instant>>,
     lapse: Cell<u32>,
+    /// The page found by Scan Document, outlined while it is processed.
+    scan_quad: RefCell<Option<scan::Quad>>,
     /// The effects picker's live previews while it is open.
     previews: RefCell<Option<Previews>>,
     thumb_sender: async_channel::Sender<Thumb>,
@@ -193,6 +196,7 @@ impl Window {
             motion_prev: RefCell::new(None),
             motion_last_shot: Cell::new(None),
             lapse: Cell::new(settings.lapse),
+            scan_quad: RefCell::new(None),
             previews: RefCell::new(None),
             thumb_sender,
             settings: RefCell::new(settings),
@@ -413,6 +417,34 @@ impl Window {
                     }
                 }
                 drop(codes);
+                if let Some(quad) = *this.scan_quad.borrow() {
+                    let accent = adw::StyleManager::default().accent_color_rgba();
+                    for (i, (x, y)) in quad.iter().enumerate() {
+                        let x = if mirrored { 1.0 - x } else { *x };
+                        let (px, py) = (vx + x * vw, vy + y * vh);
+                        if i == 0 {
+                            cr.move_to(px, py);
+                        } else {
+                            cr.line_to(px, py);
+                        }
+                    }
+                    cr.close_path();
+                    cr.set_source_rgba(
+                        accent.red() as f64,
+                        accent.green() as f64,
+                        accent.blue() as f64,
+                        0.25,
+                    );
+                    let _ = cr.fill_preserve();
+                    cr.set_source_rgba(
+                        accent.red() as f64,
+                        accent.green() as f64,
+                        accent.blue() as f64,
+                        1.0,
+                    );
+                    cr.set_line_width(3.0);
+                    let _ = cr.stroke();
+                }
                 if this.grid.get() {
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
                     cr.set_line_width(1.0);
@@ -657,6 +689,16 @@ impl Window {
         ));
         window.add_action(&gallery);
         app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
+
+        // Scan the page in front of the camera to a PDF.
+        let scan_doc = gio::SimpleAction::new("scan-document", None);
+        scan_doc.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.scan_document()
+        ));
+        window.add_action(&scan_doc);
+        app.set_accels_for_action("win.scan-document", &["<Control><Shift>d"]);
 
         // The effects picker, from the keyboard.
         let effects_action = gio::SimpleAction::new("effects", None);
@@ -1516,7 +1558,29 @@ impl Window {
             )));
             text::download_models().await?;
         }
-        // One full-size frame from the analysis tap.
+        let frame = self.grab_frame().await?;
+        if !self.reading.get() {
+            return Ok(()); // cancelled meanwhile
+        }
+        self.freeze(&frame);
+        self.ui.text_title.set_label("Reading…");
+        self.ui.text_card.set_visible(true);
+        let lines = text::read(frame).await?;
+        if !self.frozen.get() {
+            return Ok(());
+        }
+        self.ui.text_title.set_label(&match lines.len() {
+            0 => "No text found".to_string(),
+            1 => "1 line".to_string(),
+            n => format!("{n} lines"),
+        });
+        self.text_lines.replace(lines);
+        self.build_chips();
+        Ok(())
+    }
+
+    /// One full-size frame from the analysis tap.
+    async fn grab_frame(&self) -> Result<camera::Frame, String> {
         let (tx, rx) = async_channel::bounded::<camera::Frame>(1);
         let tap = {
             let camera = self.camera.borrow();
@@ -1535,24 +1599,73 @@ impl Window {
         if let Some(camera) = self.camera.borrow().as_ref() {
             camera.remove_tap(tap);
         }
-        let frame = frame?;
+        frame
+    }
+
+    /// Freeze the picture, find the page in it, straighten it, read its
+    /// text, and save a PDF.
+    fn scan_document(self: &Rc<Self>) {
+        if self.reading.get() || self.frozen.get() || self.camera.borrow().is_none() {
+            return;
+        }
+        self.reading.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Err(error) = this.scan_document_inner().await {
+                this.ui.toasts.add_toast(adw::Toast::new(&error));
+            }
+            this.reading.set(false);
+            this.unfreeze();
+        });
+    }
+
+    async fn scan_document_inner(self: &Rc<Self>) -> Result<(), String> {
+        let frame = self.grab_frame().await?;
         if !self.reading.get() {
-            return Ok(()); // cancelled meanwhile
+            return Ok(());
         }
         self.freeze(&frame);
-        self.ui.text_title.set_label("Reading…");
+        self.ui.text_title.set_label("Finding the page…");
         self.ui.text_card.set_visible(true);
-        let lines = text::read(frame).await?;
+        let found = gio::spawn_blocking({
+            let frame = frame.clone();
+            move || scan::find_page(&frame)
+        })
+        .await
+        .map_err(|_| "scan thread failed".to_string())?;
+        let quad = found.unwrap_or([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+        self.scan_quad.replace(Some(quad));
+        self.ui.overlay.queue_draw();
+        self.ui.text_title.set_label(if found.is_some() {
+            "Straightening…"
+        } else {
+            "No page found: scanning the whole picture"
+        });
+        let page = gio::spawn_blocking(move || scan::warp(&frame, &quad))
+            .await
+            .map_err(|_| "scan thread failed".to_string())?;
+        let lines = if text::models_ready() {
+            self.ui.text_title.set_label("Reading the text…");
+            text::read(page.clone()).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !self.frozen.get() {
             return Ok(());
         }
-        self.ui.text_title.set_label(&match lines.len() {
-            0 => "No text found".to_string(),
-            1 => "1 line".to_string(),
-            n => format!("{n} lines"),
-        });
-        self.text_lines.replace(lines);
-        self.build_chips();
+        self.ui.text_title.set_label("Saving…");
+        let path = special_dir(glib::UserDirectory::Documents, "Documents")
+            .join(format!("Gaze Scan {}.pdf", timestamp()));
+        let thumb = scan::thumbnail(&page, camera::THUMBNAIL_WIDTH as usize);
+        let saved = gio::spawn_blocking({
+            let path = path.clone();
+            move || scan::write_pdf(&path, &page, &lines).map(|_| path)
+        })
+        .await
+        .map_err(|_| "scan thread failed".to_string())??;
+        self.add_capture(saved.clone(), Some(thumb), false);
+        self.notify_capture("Scan saved", &saved);
+        self.toast_file("Scan saved", saved);
         Ok(())
     }
 
@@ -1574,6 +1687,9 @@ impl Window {
     /// Back to the live picture, without the chips.
     fn unfreeze(&self) {
         self.reading.set(false);
+        if self.scan_quad.take().is_some() {
+            self.ui.overlay.queue_draw();
+        }
         if self.frozen.replace(false) {
             if let Some(camera) = self.camera.borrow().as_ref() {
                 self.ui.picture.set_paintable(Some(&camera.paintable()));
@@ -2347,6 +2463,7 @@ fn build_ui(app: &adw::Application) -> Ui {
     view.append(Some("Mirror Preview"), Some("win.mirror"));
     view.append(Some("Scan Codes"), Some("win.scan"));
     view.append(Some("Motion Capture"), Some("win.motion"));
+    view.append(Some("Scan Document to PDF"), Some("win.scan-document"));
     view.append(Some("Virtual Camera"), Some("win.virtual-camera"));
     view.append(
         Some("Keep Virtual Camera After Reboot"),

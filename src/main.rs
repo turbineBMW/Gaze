@@ -6,6 +6,7 @@ mod codes;
 mod controls;
 mod motion;
 mod omarchy;
+mod scan;
 mod settings;
 mod stats;
 mod text;
