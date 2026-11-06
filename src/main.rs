@@ -32,6 +32,8 @@ label.countdown {
   text-shadow: 0 2px 24px rgb(0 0 0 / 70%);
 }
 menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
+popover.effects button { min-width: 92px; }
+popover.effects button:checked { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
 /* Toasts sit above the shutter row instead of on it. */
 toast { margin-bottom: 100px; }
 button.shutter {

@@ -19,10 +19,12 @@ sh install.sh                                # ~/.local
 
 ```
 src/main.rs      app, stylesheet (shutter, toasts, mirror transform)
-src/window.rs    window, actions (win.shutter/record/mirror/stats/scan/timer/...),
-                 stats card, code card, overlay (region, outlines, countdown), toasts
+src/window.rs    window, actions (win.shutter/record/mode/mirror/stats/scan/timer/
+                 effect/...), stats card, code card, effects picker, overlay
+                 (region, outlines, countdown), toasts
 src/camera.rs    device list (V4L2 first, by node), the pipeline, photos, recording,
-                 analysis taps (Tap/Frame: the shared CPU branch for stats, codes, text)
+                 analysis taps (Tap/Frame: the shared CPU branch for stats, codes, text),
+                 effects (EFFECTS, gleffects bin swapped in before the tee)
 src/codes.rs     QR/barcode scanner on a tap (rxing, worker thread), payload
                  classification and WIFI: parsing (unit-tested with tests/fixtures)
 src/stats.rs     colour statistics of an RGB frame (unit-tested)
@@ -42,6 +44,11 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
   scaled and rate-limited to the union of them, and tap handlers run on the
   streaming thread (hand frames to the main loop via `LatestFrame` or a
   channel).
+- The effect slot (`identity` or `glupload ! glcolorconvert ! gleffects !
+  gldownload ! capsfilter video/x-raw`) is swapped inside a BLOCK_DOWNSTREAM
+  probe on the capsfilter's src pad: unlink, NULL and remove the old, add,
+  link and sync the new, all on the streaming thread. The trailing
+  capsfilter keeps the tee in system memory.
 - Caps are forced to system-memory raw video so every branch gets the same
   frames; `videoconvert` does YUV -> RGB with the stream's colorimetry, which
   is what keeps photos and stats correct for limited-range cameras.

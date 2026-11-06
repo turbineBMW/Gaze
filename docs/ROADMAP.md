@@ -42,13 +42,18 @@ ordered by value for effort; each one leaves the app working and shippable.
 
 ## Phase 4: Photo Booth effects
 
-- `glupload ! gleffects ! gldownload` before the tee, so the preview, photos,
-  recordings and the virtual camera all get the effect. `gleffects` already
-  has mirror, squeeze, stretch, light tunnel, fisheye, twirl, bulge, square,
-  heat, sepia, x-ray, glow, sobel, blur.
-- A Photo Booth-style picker: a 3 by 3 grid of live thumbnails plus "None",
-  one page for distortions and one for colour effects.
-- Effects stay out of (or are called out in) the colour statistics.
+- [x] `glupload ! gleffects ! gldownload` swapped in before the tee under a
+      blocking pad probe, so the preview, photos, recordings, taps and (later)
+      the virtual camera all get the effect, and nothing is paid when it is
+      off.
+- [x] Sixteen effects from `gleffects`, named the Photo Booth way: Mirror,
+      Squeeze, Stretch, Light Tunnel, Fish Eye, Twirl, Bulge, Square; Sepia,
+      X-Pro, Thermal, X-Ray, Glow, Blur, Edges, Red Only.
+- [x] A picker popover with a grid of radio buttons over `win.effect`
+      (Ctrl+0 goes back to Normal).
+- [ ] Live thumbnails in the picker, like Photo Booth's pages.
+- Colour statistics measure the picture after the effect; worth a note on
+  the card.
 
 ## Phase 5: Virtual camera
 
