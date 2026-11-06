@@ -10,6 +10,7 @@ mod settings;
 mod stats;
 mod text;
 mod theme;
+mod thumbs;
 mod vcam;
 mod window;
 
@@ -36,7 +37,9 @@ label.countdown {
   text-shadow: 0 2px 24px rgb(0 0 0 / 70%);
 }
 menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
-popover.effects button { min-width: 92px; }
+popover.effects button { min-width: 92px; padding: 4px; }
+popover.effects .tile-frame { border-radius: 8px; }
+popover.effects button label { font-size: 12px; }
 levelbar.mic-level trough { min-height: 8px; background-color: rgb(0 0 0 / 45%); border: none; }
 levelbar.mic-level block { min-height: 8px; }
 button.thumb { padding: 3px; border-radius: 12px; min-width: 0; min-height: 0; }
@@ -74,10 +77,20 @@ button.shutter.recording > .inner {
 fn main() -> glib::ExitCode {
     // `gaze --add-virtual-camera` is what Gaze runs as root (through pkexec)
     // to make the loopback device; it prints the device and exits.
-    if std::env::args().nth(1).as_deref() == Some(vcam::ADD_FLAG) {
-        return match vcam::add_as_root() {
-            Ok(path) => {
-                println!("{}", path.display());
+    let root_task = match std::env::args().nth(1).as_deref() {
+        Some(vcam::ADD_FLAG) => Some(vcam::add_as_root().map(|p| p.display().to_string())),
+        Some(vcam::INSTALL_FLAG) => Some(vcam::install_service_as_root().map(|_| String::new())),
+        Some(vcam::UNINSTALL_FLAG) => {
+            Some(vcam::uninstall_service_as_root().map(|_| String::new()))
+        }
+        _ => None,
+    };
+    if let Some(result) = root_task {
+        return match result {
+            Ok(out) => {
+                if !out.is_empty() {
+                    println!("{out}");
+                }
                 glib::ExitCode::SUCCESS
             }
             Err(error) => {

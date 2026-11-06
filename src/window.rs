@@ -10,6 +10,7 @@ use crate::motion;
 use crate::settings::{Settings, LAPSES, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
+use crate::thumbs::{Previews, Thumb};
 use crate::vcam;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -75,6 +76,9 @@ struct Ui {
     /// The camera controls popover's content, rebuilt per camera.
     controls_box: gtk::Box,
     controls_button: gtk::MenuButton,
+    /// The effects picker and its live tiles, by effect id ("none" too).
+    effects_button: gtk::MenuButton,
+    effect_pictures: Vec<(&'static str, gtk::Picture)>,
 }
 
 pub struct Window {
@@ -132,6 +136,9 @@ pub struct Window {
     motion_prev: RefCell<Option<camera::Frame>>,
     motion_last_shot: Cell<Option<Instant>>,
     lapse: Cell<u32>,
+    /// The effects picker's live previews while it is open.
+    previews: RefCell<Option<Previews>>,
+    thumb_sender: async_channel::Sender<Thumb>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -149,6 +156,7 @@ impl Window {
         // The scanner's worker thread sends each scan here; only the newest
         // unread one is kept.
         let (code_sender, code_receiver) = async_channel::bounded::<Vec<Code>>(1);
+        let (thumb_sender, thumb_receiver) = async_channel::bounded::<Thumb>(64);
         let this = Rc::new(Self {
             ui,
             mirror: Cell::new(settings.mirror),
@@ -185,6 +193,8 @@ impl Window {
             motion_prev: RefCell::new(None),
             motion_last_shot: Cell::new(None),
             lapse: Cell::new(settings.lapse),
+            previews: RefCell::new(None),
+            thumb_sender,
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -203,6 +213,15 @@ impl Window {
             async move {
                 while let Ok(codes) = code_receiver.recv().await {
                     this.on_codes(codes);
+                }
+            }
+        ));
+        glib::spawn_future_local(glib::clone!(
+            #[weak]
+            this,
+            async move {
+                while let Ok((id, frame)) = thumb_receiver.recv().await {
+                    this.on_thumb(id, frame);
                 }
             }
         ));
@@ -249,6 +268,18 @@ impl Window {
             move |_| this.stop_burst()
         ));
         ui.shutter.add_controller(hold);
+        if let Some(popover) = ui.effects_button.popover() {
+            popover.connect_show(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| this.start_previews()
+            ));
+            popover.connect_hide(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| this.stop_previews()
+            ));
+        }
         ui.gallery.connect_child_activated(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -627,6 +658,16 @@ impl Window {
         window.add_action(&gallery);
         app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
 
+        // The effects picker, from the keyboard.
+        let effects_action = gio::SimpleAction::new("effects", None);
+        effects_action.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.ui.effects_button.popup()
+        ));
+        window.add_action(&effects_action);
+        app.set_accels_for_action("win.effects", &["<Control><Shift>e"]);
+
         // The camera controls popover, from the keyboard.
         let controls_action = gio::SimpleAction::new("controls", None);
         controls_action.connect_activate(glib::clone!(
@@ -646,6 +687,35 @@ impl Window {
         ));
         window.add_action(&copy_last);
         app.set_accels_for_action("win.copy-last", &["<Control><Shift>c"]);
+
+        // Keep the virtual camera device across reboots: a system service
+        // installed (or removed) through pkexec.
+        let permanent = gio::SimpleAction::new_stateful(
+            "virtual-camera-permanent",
+            None,
+            &vcam::service_installed().to_variant(),
+        );
+        permanent.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let want = !vcam::service_installed();
+                let action = action.clone();
+                let this = this.clone();
+                glib::spawn_future_local(async move {
+                    match vcam::set_service(want).await {
+                        Ok(()) => this.ui.toasts.add_toast(adw::Toast::new(if want {
+                            "The virtual camera will be there after every boot"
+                        } else {
+                            "The virtual camera will need a prompt after a reboot"
+                        })),
+                        Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&error)),
+                    }
+                    action.set_state(&vcam::service_installed().to_variant());
+                });
+            }
+        ));
+        window.add_action(&permanent);
 
         let close_code = gio::SimpleAction::new("close-code", None);
         close_code.connect_activate(glib::clone!(
@@ -984,6 +1054,7 @@ impl Window {
                 self.stats_tap.set(None);
                 self.motion_tap.set(None);
                 self.scanner.replace(None);
+                self.previews.replace(None);
                 if let Err(error) = camera.set_effect(self.effect.get()) {
                     log::warn!("{error}");
                     self.effect.set(None);
@@ -1611,6 +1682,49 @@ impl Window {
         });
     }
 
+    fn start_previews(&self) {
+        if self.previews.borrow().is_some() {
+            return;
+        }
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            return;
+        };
+        match Previews::start(camera, self.thumb_sender.clone()) {
+            Ok(previews) => {
+                self.previews.replace(Some(previews));
+            }
+            Err(error) => log::warn!("effect previews: {error}"),
+        }
+    }
+
+    fn stop_previews(&self) {
+        if let Some(previews) = self.previews.take() {
+            if let Some(camera) = self.camera.borrow().as_ref() {
+                previews.stop(camera);
+            }
+        }
+    }
+
+    /// A thumbnail from the previews: onto its tile.
+    fn on_thumb(&self, id: &'static str, frame: camera::Frame) {
+        if self.previews.borrow().is_none() {
+            return;
+        }
+        let Some((_, picture)) = self.ui.effect_pictures.iter().find(|(i, _)| *i == id) else {
+            return;
+        };
+        let bytes = glib::Bytes::from(&frame.rgb);
+        let texture = gdk::MemoryTexture::new(
+            frame.width as i32,
+            frame.height as i32,
+            gdk::MemoryFormat::R8g8b8,
+            &bytes,
+            frame.stride,
+        );
+        picture.set_paintable(Some(&texture));
+    }
+
     /// Take a photo of the frame on screen and file it.
     fn snap_photo(self: &Rc<Self>, title: &'static str) {
         let camera = self.camera.borrow();
@@ -2234,6 +2348,10 @@ fn build_ui(app: &adw::Application) -> Ui {
     view.append(Some("Scan Codes"), Some("win.scan"));
     view.append(Some("Motion Capture"), Some("win.motion"));
     view.append(Some("Virtual Camera"), Some("win.virtual-camera"));
+    view.append(
+        Some("Keep Virtual Camera After Reboot"),
+        Some("win.virtual-camera-permanent"),
+    );
     view.append(Some("Colour Statistics"), Some("win.stats"));
     menu.append_section(None, &view);
     let files = gio::Menu::new();
@@ -2500,7 +2618,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         .build();
     left.append(&mode_toggle);
     left.append(&timer_button);
-    left.append(&effects_button());
+    let (effects_button, effect_pictures) = effects_button();
+    left.append(&effects_button);
     let controls_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -2708,6 +2827,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         gallery,
         controls_box,
         controls_button,
+        effects_button,
+        effect_pictures,
     }
 }
 
@@ -2788,9 +2909,10 @@ async fn run(argv: &[&str]) -> Result<(), String> {
     }
 }
 
-/// The effects picker: a popover with a grid of radio buttons over
-/// win.effect, distortions first, then colours, like Photo Booth's pages.
-fn effects_button() -> gtk::MenuButton {
+/// The effects picker: a popover with a grid of live tiles (radio buttons
+/// over win.effect), distortions first, then colours, like Photo Booth's
+/// pages. Returns the button and each tile's picture by effect id.
+fn effects_button() -> (gtk::MenuButton, Vec<(&'static str, gtk::Picture)>) {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
@@ -2799,17 +2921,41 @@ fn effects_button() -> gtk::MenuButton {
         .margin_start(6)
         .margin_end(6)
         .build();
-    let tile = |label: &str, id: &str| {
+    let mut pictures = Vec::new();
+    let mut tile = |label: &str, id: &'static str| {
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .build();
+        let frame = gtk::Overlay::builder()
+            .child(
+                &gtk::Box::builder()
+                    .width_request(112)
+                    .height_request(63)
+                    .build(),
+            )
+            .overflow(gtk::Overflow::Hidden)
+            .halign(gtk::Align::Center)
+            .build();
+        frame.add_css_class("tile-frame");
+        frame.add_overlay(&picture);
+        frame.set_clip_overlay(&picture, true);
+        let inner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(3)
+            .build();
+        inner.append(&frame);
+        inner.append(&gtk::Label::new(Some(label)));
         let button = gtk::ToggleButton::builder()
-            .label(label)
+            .child(&inner)
             .action_name("win.effect")
             .action_target(&id.to_variant())
             .build();
         button.add_css_class("flat");
+        pictures.push((id, picture));
         button
     };
     let none = tile("Normal", "none");
-    none.set_halign(gtk::Align::Fill);
+    none.set_halign(gtk::Align::Center);
     content.append(&none);
     for (title, distorts) in [("Distort", true), ("Colour", false)] {
         let heading = gtk::Label::builder().label(title).xalign(0.0).build();
@@ -2846,7 +2992,7 @@ fn effects_button() -> gtk::MenuButton {
         .build();
     button.add_css_class("osd");
     button.add_css_class("circular");
-    button
+    (button, pictures)
 }
 
 fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {

@@ -12,6 +12,106 @@ use std::path::PathBuf;
 
 pub const LABEL: &str = "Gaze";
 pub const ADD_FLAG: &str = "--add-virtual-camera";
+pub const INSTALL_FLAG: &str = "--install-virtual-camera-service";
+pub const UNINSTALL_FLAG: &str = "--uninstall-virtual-camera-service";
+
+const UNIT: &str = "/etc/systemd/system/gaze-virtual-camera.service";
+const MODULES: &str = "/etc/modules-load.d/gaze-v4l2loopback.conf";
+
+/// Whether the boot-time service that recreates the device is installed.
+pub fn service_installed() -> bool {
+    std::path::Path::new(UNIT).exists()
+}
+
+/// Run one of this binary's root tasks through pkexec.
+async fn as_root(flag: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let argv: Vec<std::ffi::OsString> = vec!["pkexec".into(), exe.into(), flag.into()];
+    let process = gio::Subprocess::newv(
+        &argv.iter().map(|a| a.as_os_str()).collect::<Vec<_>>(),
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_PIPE,
+    )
+    .map_err(|e| format!("cannot run pkexec: {e}"))?;
+    let (_, stderr) = process
+        .communicate_utf8_future(None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if process.is_successful() {
+        return Ok(());
+    }
+    let why = stderr.map(|s| s.to_string()).unwrap_or_default();
+    let why = why.trim().lines().last().unwrap_or("").to_string();
+    Err(if why.is_empty() || why.contains("dismissed") {
+        "Cancelled.".into()
+    } else {
+        why
+    })
+}
+
+/// Install (or remove) the service that adds the device at boot, after a
+/// polkit prompt.
+pub async fn set_service(installed: bool) -> Result<(), String> {
+    as_root(if installed {
+        INSTALL_FLAG
+    } else {
+        UNINSTALL_FLAG
+    })
+    .await
+}
+
+/// `gaze --install-virtual-camera-service`, as root: a oneshot unit that
+/// runs this very binary's `--add-virtual-camera` once the loopback
+/// module is loaded, and a modules-load.d entry so it is.
+pub fn install_service_as_root() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let unit = format!(
+        "[Unit]\n\
+         Description=Gaze virtual camera (v4l2loopback device named {LABEL})\n\
+         After=systemd-modules-load.service\n\
+         ConditionPathExists=/dev/v4l2loopback\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={} {ADD_FLAG}\n\
+         RemainAfterExit=yes\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe.display()
+    );
+    std::fs::write(UNIT, unit).map_err(|e| format!("{UNIT}: {e}"))?;
+    std::fs::write(MODULES, "v4l2loopback\n").map_err(|e| format!("{MODULES}: {e}"))?;
+    systemctl(&["daemon-reload"])?;
+    systemctl(&["enable", "gaze-virtual-camera.service"])
+}
+
+pub fn uninstall_service_as_root() -> Result<(), String> {
+    let _ = systemctl(&["disable", "gaze-virtual-camera.service"]);
+    for path in [UNIT, MODULES] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("{path}: {error}"));
+            }
+        }
+    }
+    systemctl(&["daemon-reload"])
+}
+
+fn systemctl(args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
 
 /// The loopback device named [`LABEL`], if there is one.
 pub fn find() -> Option<PathBuf> {

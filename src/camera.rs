@@ -1093,7 +1093,7 @@ fn tap_caps(max_width: Option<u32>) -> gst::Caps {
     caps.build()
 }
 
-fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
+pub(crate) fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
     let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
