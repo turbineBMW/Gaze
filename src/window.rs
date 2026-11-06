@@ -85,6 +85,9 @@ struct Ui {
     mode_toggle: adw::ToggleGroup,
     timer: gtk::Label,
     flash: gtk::Box,
+    controls: gtk::CenterBox,
+    /// Leaves compact mode; only shown in it.
+    expand: gtk::Button,
     toolbar: adw::ToolbarView,
     /// The Format submenu, refilled for each camera.
     formats_menu: gio::Menu,
@@ -161,9 +164,11 @@ pub struct Window {
     lapse: Cell<u32>,
     /// The page found by Scan Document, outlined while it is processed.
     scan_quad: RefCell<Option<scan::Quad>>,
-    /// Background blur wanted (the setting) and being set up.
-    blur_on: Cell<bool>,
-    blur_starting: Cell<bool>,
+    /// The backdrop wanted ("none", "blur" or a picture's path), being set
+    /// up, and compact mode.
+    background: RefCell<String>,
+    background_starting: Cell<bool>,
+    compact: Cell<bool>,
     /// A GIF being captured, and since when.
     gif: RefCell<Option<GifCapture>>,
     gif_since: Cell<Option<Instant>>,
@@ -225,8 +230,9 @@ impl Window {
             motion_last_shot: Cell::new(None),
             lapse: Cell::new(settings.lapse),
             scan_quad: RefCell::new(None),
-            blur_on: Cell::new(settings.background_blur),
-            blur_starting: Cell::new(false),
+            background: RefCell::new(settings.background.clone()),
+            background_starting: Cell::new(false),
+            compact: Cell::new(false),
             gif: RefCell::new(None),
             gif_since: Cell::new(None),
             previews: RefCell::new(None),
@@ -717,19 +723,82 @@ impl Window {
         window.add_action(&gallery);
         app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
 
-        // Blur the background behind the person.
-        let blur = gio::SimpleAction::new_stateful(
-            "background-blur",
-            None,
-            &self.blur_on.get().to_variant(),
+        // The backdrop: a radio over "none", "blur" and "image" (the
+        // picture last chosen), plus ways to pick the picture.
+        let background = gio::SimpleAction::new_stateful(
+            "background",
+            Some(glib::VariantTy::STRING),
+            &background_state(&self.background.borrow()).to_variant(),
         );
+        background.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                let wanted = match value.and_then(|v| v.str()) {
+                    Some("blur") => "blur".to_string(),
+                    Some("image") => {
+                        let current = this.background.borrow().clone();
+                        if current != "none" && current != "blur" {
+                            current
+                        } else {
+                            this.choose_background_picture();
+                            return;
+                        }
+                    }
+                    _ => "none".to_string(),
+                };
+                this.set_background(wanted);
+            }
+        ));
+        window.add_action(&background);
+
+        // Ctrl+B: blur on and off, the quick way.
+        let blur = gio::SimpleAction::new("background-blur", None);
         blur.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_, _| this.set_background_blur(!this.blur_on.get())
+            move |_, _| {
+                let next = if *this.background.borrow() == "blur" {
+                    "none"
+                } else {
+                    "blur"
+                };
+                this.set_background(next.to_string());
+            }
         ));
         window.add_action(&blur);
         app.set_accels_for_action("win.background-blur", &["<Control>b"]);
+
+        let choose = gio::SimpleAction::new("choose-background", None);
+        choose.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.choose_background_picture()
+        ));
+        window.add_action(&choose);
+
+        let wallpaper = gio::SimpleAction::new("background-wallpaper", None);
+        wallpaper.set_enabled(omarchy_wallpaper().is_some());
+        wallpaper.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                if let Some(path) = omarchy_wallpaper() {
+                    this.set_background(path.to_string_lossy().to_string());
+                }
+            }
+        ));
+        window.add_action(&wallpaper);
+
+        // Compact: a small, always-on-top mirror in the corner.
+        let compact = gio::SimpleAction::new_stateful("compact", None, &false.to_variant());
+        compact.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.set_compact(!this.compact.get())
+        ));
+        window.add_action(&compact);
+        app.set_accels_for_action("win.compact", &["<Control>k"]);
 
         // Scan the page in front of the camera to a PDF.
         let scan_doc = gio::SimpleAction::new("scan-document", None);
@@ -862,6 +931,8 @@ impl Window {
                     this.cancel_countdown();
                 } else if this.frozen.get() || this.reading.get() {
                     this.unfreeze();
+                } else if this.compact.get() {
+                    this.set_compact(false);
                 } else if this.ui.window.is_fullscreen() {
                     this.ui.window.unfullscreen();
                 }
@@ -1150,8 +1221,8 @@ impl Window {
                 if self.virtual_on.get() {
                     self.start_virtual_camera();
                 }
-                if self.blur_on.get() {
-                    self.start_background_blur();
+                if *self.background.borrow() != "none" {
+                    self.start_background();
                 }
                 self.ui.stack.set_visible_child_name("viewfinder");
                 self.update_shutter();
@@ -1792,37 +1863,60 @@ impl Window {
 
     /// Turn background blur on (fetching the model the first time) or off,
     /// and remember the choice.
-    fn set_background_blur(self: &Rc<Self>, on: bool) {
-        self.blur_on.set(on);
-        self.settings.borrow_mut().background_blur = on;
+    /// Remember and apply a backdrop: "none", "blur" or a picture's path.
+    fn set_background(self: &Rc<Self>, wanted: String) {
+        self.background.replace(wanted.clone());
+        self.settings.borrow_mut().background = wanted.clone();
         self.settings.borrow().save();
-        if let Some(action) = self.ui.window.lookup_action("background-blur") {
+        if let Some(action) = self.ui.window.lookup_action("background") {
             if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
-                action.set_state(&on.to_variant());
+                action.set_state(&background_state(&wanted).to_variant());
             }
         }
-        if on {
-            self.start_background_blur();
-        } else if let Some(camera) = self.camera.borrow().as_ref() {
-            if let Err(error) = camera.set_background_blur(false) {
-                log::warn!("{error}");
+        if wanted == "none" {
+            if let Some(camera) = self.camera.borrow().as_ref() {
+                if let Err(error) = camera.set_background(None) {
+                    log::warn!("{error}");
+                }
             }
+        } else {
+            self.start_background();
         }
     }
 
-    fn start_background_blur(self: &Rc<Self>) {
-        if self.blur_starting.get() {
+    /// Pick a picture for the backdrop.
+    fn choose_background_picture(self: &Rc<Self>) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Pictures"));
+        filter.add_pixbuf_formats();
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder()
+            .title("Background Picture")
+            .filters(&filters)
+            .modal(true)
+            .build();
+        let this = self.clone();
+        dialog.open(
+            Some(&self.ui.window),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        this.set_background(path.to_string_lossy().to_string());
+                    }
+                }
+            },
+        );
+    }
+
+    /// Fetch the model if needed, load the picture if any, and hand the
+    /// backdrop to the camera.
+    fn start_background(self: &Rc<Self>) {
+        if self.background_starting.get() || self.camera.borrow().is_none() {
             return;
         }
-        if self
-            .camera
-            .borrow()
-            .as_ref()
-            .is_none_or(Camera::background_blur)
-        {
-            return;
-        }
-        self.blur_starting.set(true);
+        self.background_starting.set(true);
         let this = self.clone();
         glib::spawn_future_local(async move {
             let result = async {
@@ -1833,20 +1927,58 @@ impl Window {
                     )));
                     matte::download_model().await?;
                 }
-                if !this.blur_on.get() {
-                    return Ok(());
-                }
+                let wanted = this.background.borrow().clone();
+                let backdrop = match wanted.as_str() {
+                    "none" => return Ok(()),
+                    "blur" => matte::Backdrop::Blur,
+                    path => {
+                        let path = PathBuf::from(path);
+                        let image = gio::spawn_blocking(move || load_picture(&path))
+                            .await
+                            .map_err(|_| "picture thread failed".to_string())??;
+                        matte::Backdrop::Image(std::sync::Arc::new(image))
+                    }
+                };
                 let camera = this.camera.borrow();
                 let camera = camera.as_ref().ok_or("no camera")?;
-                camera.set_background_blur(true)
+                camera.set_background(Some(backdrop))
             }
             .await;
-            this.blur_starting.set(false);
+            this.background_starting.set(false);
             if let Err(error) = result {
                 this.ui.toasts.add_toast(adw::Toast::new(&error));
-                this.set_background_blur(false);
+                this.set_background("none".into());
             }
         });
+    }
+
+    /// Compact: just the picture, small, floating and pinned on Hyprland.
+    fn set_compact(&self, on: bool) {
+        self.compact.set(on);
+        if let Some(action) = self.ui.window.lookup_action("compact") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&on.to_variant());
+            }
+        }
+        let ui = &self.ui;
+        ui.toolbar
+            .set_reveal_top_bars(!on && !ui.window.is_fullscreen());
+        ui.controls.set_visible(!on);
+        ui.expand.set_visible(on);
+        if on {
+            ui.stats_card.set_visible(false);
+            self.close_code();
+            self.unfreeze();
+        } else {
+            ui.stats_card.set_visible(self.stats_on.get());
+        }
+        let (w, h) = (480, 270);
+        if on {
+            ui.window.set_default_size(w, h);
+        } else {
+            ui.window.set_default_size(1100, 720);
+        }
+        crate::hypr::set_compact(on, w, h);
     }
 
     /// Turn the virtual camera on (creating the device if needed) or off,
@@ -2646,7 +2778,18 @@ fn build_ui(app: &adw::Application) -> Ui {
     menu.append_section(None, &picture_menu);
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
-    view.append(Some("Blur Background"), Some("win.background-blur"));
+    let background_menu = gio::Menu::new();
+    for (label, id) in [("None", "none"), ("Blur", "blur"), ("Picture", "image")] {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some("win.background"), Some(&id.to_variant()));
+        background_menu.append_item(&item);
+    }
+    let background_pick = gio::Menu::new();
+    background_pick.append(Some("Omarchy Wallpaper"), Some("win.background-wallpaper"));
+    background_pick.append(Some("Choose Picture…"), Some("win.choose-background"));
+    background_menu.append_section(None, &background_pick);
+    view.append_submenu(Some("Background"), &background_menu);
+    view.append(Some("Compact Mirror"), Some("win.compact"));
     view.append(Some("Scan Codes"), Some("win.scan"));
     view.append(Some("Motion Capture"), Some("win.motion"));
     view.append(Some("Scan Document to PDF"), Some("win.scan-document"));
@@ -3079,6 +3222,19 @@ fn build_ui(app: &adw::Application) -> Ui {
     overlay.add_overlay(&code_card);
     overlay.add_overlay(&text_card);
     overlay.add_overlay(&controls);
+    let expand = gtk::Button::builder()
+        .icon_name("view-restore-symbolic")
+        .action_name("win.compact")
+        .tooltip_text("Leave Compact Mirror")
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::End)
+        .margin_end(8)
+        .margin_bottom(8)
+        .visible(false)
+        .build();
+    expand.add_css_class("osd");
+    expand.add_css_class("circular");
+    overlay.add_overlay(&expand);
 
     let status = adw::StatusPage::builder()
         .icon_name("camera-disabled-symbolic")
@@ -3127,6 +3283,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         mode_toggle,
         timer,
         flash,
+        controls,
+        expand,
         toolbar,
         formats_menu,
         mics_menu,
@@ -3303,6 +3461,53 @@ fn effects_button() -> (gtk::MenuButton, Vec<(&'static str, gtk::Picture)>) {
     button.add_css_class("osd");
     button.add_css_class("circular");
     (button, pictures)
+}
+
+/// Menu radio state for a backdrop setting.
+fn background_state(setting: &str) -> &'static str {
+    match setting {
+        "none" => "none",
+        "blur" => "blur",
+        _ => "image",
+    }
+}
+
+/// Omarchy's current wallpaper, if this is an Omarchy desktop.
+fn omarchy_wallpaper() -> Option<PathBuf> {
+    let link = glib::home_dir().join(".local/state/omarchy/current/background");
+    std::fs::canonicalize(link).ok().filter(|p| p.is_file())
+}
+
+/// A picture file as a packed RGB frame, at most 1920 px wide.
+fn load_picture(path: &std::path::Path) -> Result<camera::Frame, String> {
+    let pixbuf =
+        gtk::gdk_pixbuf::Pixbuf::from_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+    let pixbuf = if pixbuf.width() > 1920 {
+        let h = (pixbuf.height() as i64 * 1920 / pixbuf.width() as i64).max(1) as i32;
+        pixbuf
+            .scale_simple(1920, h, gtk::gdk_pixbuf::InterpType::Bilinear)
+            .ok_or("cannot scale the picture")?
+    } else {
+        pixbuf
+    };
+    let (w, h) = (pixbuf.width() as usize, pixbuf.height() as usize);
+    let channels = pixbuf.n_channels() as usize;
+    let stride = pixbuf.rowstride() as usize;
+    let pixels = pixbuf.read_pixel_bytes();
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * channels;
+            rgb.extend_from_slice(&pixels[i..i + 3]);
+        }
+    }
+    Ok(camera::Frame {
+        rgb,
+        width: w,
+        height: h,
+        stride: w * 3,
+    })
 }
 
 fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {

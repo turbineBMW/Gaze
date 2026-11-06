@@ -84,8 +84,9 @@ ordered by value for effort; each one leaves the app working and shippable.
       continuous file; Microphone submenu and a live level meter.
 - [x] Rule-of-thirds grid, fullscreen (F11), capture notifications when
       Gaze is not focused, `app.quit` for scripts.
-- [ ] A compact always-on-top mirror mode (a Hyprland window rule does it
-      today: `windowrule = pin, class:io.github.turbinebmw.Gaze`).
+- [x] Compact Mirror (Ctrl+K): just the picture, 480 px wide, floated
+      and pinned in the corner of its monitor through Hyprland's Lua
+      dispatch API; Escape or the corner button puts it back.
 - [x] Live thumbnails in the effects picker (a second small GL pipeline
       while it is open).
 - [x] Keep Virtual Camera After Reboot: a oneshot system unit, installed
@@ -103,8 +104,8 @@ ordered by value for effort; each one leaves the app working and shippable.
       10 fps on three cores; every frame is composited over a blurred copy
       of itself in a second pipeline slot, so photos, recordings and the
       virtual camera get it too.
-- [ ] Background replacement (a picture instead of the blur) is the same
-      composite with a different backdrop.
+- [x] Background: None, Blur, the Omarchy wallpaper, or any picture
+      (scaled to cover the frame), from the Background submenu.
 - Auto-framing is the ISP relay's job on the Surface.
 
 ## Also done

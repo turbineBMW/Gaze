@@ -17,9 +17,13 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
-- Blur Background (Ctrl+B): a person matte from Robust Video Matting (15 MB,
-  downloaded on first use) keeps you sharp and blurs the room, in photos,
-  recordings and the virtual camera too.
+- Background (menu): Blur (Ctrl+B), the Omarchy wallpaper, or any picture
+  behind you. A person matte from Robust Video Matting (15 MB, downloaded
+  on first use) keeps you sharp; the result goes into photos, recordings
+  and the virtual camera too.
+- Compact Mirror (Ctrl+K): a small always-on-top picture in the corner of
+  the screen, for checking yourself before a call; Escape brings the window
+  back.
 - GIF mode next to Photo and Video: up to eight seconds, looping, saved
   beside the photos.
 - `gaze --do shutter` (or `mode gif`, `effect twirl`, `background-blur`,

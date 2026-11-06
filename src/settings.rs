@@ -22,8 +22,8 @@ pub struct Settings {
     pub mic: Option<String>,
     /// Time-lapse speed for recordings; 1 is off.
     pub lapse: u32,
-    /// Blur the background behind the person.
-    pub background_blur: bool,
+    /// What goes behind the person: "none", "blur", or a picture's path.
+    pub background: String,
 }
 
 /// The time-lapse speeds offered.
@@ -47,7 +47,7 @@ impl Settings {
             formats: Vec::new(),
             mic: None,
             lapse: 1,
-            background_blur: false,
+            background: "none".into(),
         };
         let Ok(text) = std::fs::read_to_string(path()) else {
             return settings;
@@ -58,7 +58,9 @@ impl Settings {
                 Some(("mirror", v)) => settings.mirror = v.trim() == "true",
                 Some(("virtual_camera", v)) => settings.virtual_camera = v.trim() == "true",
                 Some(("grid", v)) => settings.grid = v.trim() == "true",
-                Some(("background_blur", v)) => settings.background_blur = v.trim() == "true",
+                Some(("background", v)) if !v.trim().is_empty() => {
+                    settings.background = v.trim().to_string();
+                }
                 Some(("mic", v)) if !v.trim().is_empty() => settings.mic = Some(v.trim().into()),
                 Some(("lapse", v)) => {
                     if let Ok(l) = v.trim().parse::<u32>() {
@@ -118,7 +120,7 @@ impl Settings {
             text.push_str(&format!("mic={mic}\n"));
         }
         text.push_str(&format!("lapse={}\n", self.lapse));
-        text.push_str(&format!("background_blur={}\n", self.background_blur));
+        text.push_str(&format!("background={}\n", self.background));
         if let Err(error) = std::fs::write(&path, text) {
             log::warn!("cannot save {}: {error}", path.display());
         }
