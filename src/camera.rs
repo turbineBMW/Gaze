@@ -6,6 +6,7 @@
 //!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! capsfilter ! appsink (RGB)
 //!                                                              analysis taps
 //!   tee. ! [recording bin: H.264 (VA-API) + AAC -> MP4]      added while recording
+//!   tee. ! [output bin: queue ! videoconvert ! v4l2sink]      added while the virtual camera is on
 //! ```
 //!
 //! The analysis branch is one CPU path shared by everything that wants to
@@ -68,6 +69,10 @@ pub fn list() -> Vec<CameraInfo> {
                 .or_else(|_| p.get::<String>("device.path"))
                 .ok()
         });
+        // Gaze's own virtual camera is not a camera for Gaze.
+        if name == crate::vcam::LABEL {
+            continue;
+        }
         match (api.as_str(), path) {
             ("v4l2", Some(path)) => {
                 if !seen.contains(&path) {
@@ -93,6 +98,8 @@ pub enum Event {
     Error(String),
     RecordingSaved(PathBuf),
     RecordingFailed(String),
+    /// The virtual camera branch failed and was removed.
+    OutputFailed(String),
 }
 
 /// A frame from the analysis branch: packed RGB, 3 bytes a pixel, `stride`
@@ -209,9 +216,11 @@ pub struct Camera {
     tap_filter: gst::Element,
     taps: Arc<Mutex<Taps>>,
     recording: std::cell::RefCell<Option<Recording>>,
+    output: std::cell::RefCell<Option<Recording>>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
+/// A bin hanging off the tee: the recorder or the virtual camera output.
 struct Recording {
     bin: gst::Bin,
     tee_pad: gst::Pad,
@@ -338,14 +347,15 @@ impl Camera {
                     MessageView::Error(err) => {
                         let text = err.error().to_string();
                         log::warn!("{text} ({:?})", err.debug());
-                        // An error inside the recording bin ends the
-                        // recording, not the viewfinder.
-                        let from_recording = message
+                        // An error inside the recording or output bin ends
+                        // that branch, not the viewfinder.
+                        let element = message
                             .src()
-                            .and_then(|s| s.downcast_ref::<gst::Element>().cloned())
-                            .is_some_and(|e| in_recording_bin(&e));
-                        if from_recording {
+                            .and_then(|s| s.downcast_ref::<gst::Element>().cloned());
+                        if element.as_ref().is_some_and(|e| in_bin(e, "recording")) {
                             on_event(Event::RecordingFailed(text));
+                        } else if element.as_ref().is_some_and(|e| in_bin(e, "output")) {
+                            on_event(Event::OutputFailed(text));
                         } else {
                             on_event(Event::Error(text));
                         }
@@ -393,6 +403,7 @@ impl Camera {
             tap_filter,
             taps,
             recording: std::cell::RefCell::new(None),
+            output: std::cell::RefCell::new(None),
             _bus_watch: bus_watch,
         })
     }
@@ -609,10 +620,10 @@ impl Drop for Camera {
     }
 }
 
-fn in_recording_bin(element: &gst::Element) -> bool {
+fn in_bin(element: &gst::Element, name: &str) -> bool {
     let mut parent = element.parent();
     while let Some(p) = parent {
-        if p.name() == "recording" {
+        if p.name() == name {
             return true;
         }
         parent = p.parent();
@@ -629,6 +640,64 @@ fn finish_recording(pipeline: &gst::Pipeline) -> Option<PathBuf> {
     let _ = bin.set_state(gst::State::Null);
     let _ = pipeline.remove(&bin);
     path
+}
+
+impl Camera {
+    pub fn is_output(&self) -> bool {
+        self.output.borrow().is_some()
+    }
+
+    /// Feed the virtual camera at `device` from the tee (YUY2, no sync, so
+    /// a slow reader never holds the viewfinder up).
+    pub fn start_output(&self, device: &Path) -> Result<(), String> {
+        if self.is_output() {
+            return Ok(());
+        }
+        let description = format!(
+            "queue max-size-buffers=2 leaky=downstream ! videoconvert \
+               ! video/x-raw,format=YUY2 ! v4l2sink name=vsink sync=false device=\"{}\"",
+            device.display().to_string().replace('"', "\\\"")
+        );
+        let bin = gst::parse::bin_from_description(&description, true)
+            .map_err(|e| format!("cannot build the virtual camera output: {e}"))?;
+        bin.set_property("name", "output");
+        let sink_pad = bin.static_pad("sink").ok_or("output has no input")?;
+        self.pipeline.add(&bin).map_err(|e| e.to_string())?;
+        if let Err(error) = bin.sync_state_with_parent() {
+            let _ = bin.set_state(gst::State::Null);
+            let _ = self.pipeline.remove(&bin);
+            return Err(format!("cannot open {}: {error}", device.display()));
+        }
+        let tee_pad = self
+            .tee
+            .request_pad_simple("src_%u")
+            .ok_or("tee has no free pad")?;
+        tee_pad
+            .link(&sink_pad)
+            .map_err(|e| format!("cannot attach the virtual camera: {e:?}"))?;
+        self.output.replace(Some(Recording { bin, tee_pad }));
+        Ok(())
+    }
+
+    /// Detach and drop the virtual camera branch.
+    pub fn stop_output(&self) {
+        let Some(out) = self.output.take() else {
+            return;
+        };
+        let pipeline = self.pipeline.clone();
+        let tee = self.tee.clone();
+        let bin = out.bin.clone();
+        out.tee_pad
+            .add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+                if let Some(peer) = pad.peer() {
+                    let _ = pad.unlink(&peer);
+                }
+                tee.release_request_pad(pad);
+                let _ = bin.set_state(gst::State::Null);
+                let _ = pipeline.remove(&bin);
+                gst::PadProbeReturn::Remove
+            });
+    }
 }
 
 /// Hook for the window: forget the recording once its file is done.

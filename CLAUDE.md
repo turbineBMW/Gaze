@@ -29,10 +29,12 @@ src/codes.rs     QR/barcode scanner on a tap (rxing, worker thread), payload
                  classification and WIFI: parsing (unit-tested with tests/fixtures)
 src/text.rs      text recognition on a frozen frame (ocrs; models fetched to
                  ~/.cache/gaze/ocrs with curl; the engine test needs them)
+src/vcam.rs      the virtual camera device: find by name, create as root through
+                 pkexec (gaze --add-virtual-camera does the V4L2LOOPBACK_CTL_ADD ioctl)
 src/stats.rs     colour statistics of an RGB frame (unit-tested)
 src/omarchy.rs   Omarchy colors.toml -> libadwaita CSS (port of Rustle's; tested)
 src/theme.rs     applies it and follows theme changes live
-src/settings.rs  ~/.config/gaze/settings (camera, mirror, timer)
+src/settings.rs  ~/.config/gaze/settings (camera, mirror, timer, virtual_camera)
 docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
 ```
 
@@ -58,6 +60,10 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
   current running time start the file at zero; stopping sends EOS down both
   branches and the bin's `message-forward` EOS (`GstBinForwarded`) says the
   MP4 is complete.
+- The virtual camera output is another bin on the tee (name "output"), like
+  the recorder; bus errors from inside it become `Event::OutputFailed` and
+  only that branch is dropped. The loopback device is exclusive-caps, so
+  readers fail to open it while Gaze is not feeding it: expected.
 - Window actions are on D-Bus at `/io/github/turbinebmw/Gaze/window/1`
   (`org.gtk.Actions.Activate`), handy for scripted tests:
   `gdbus call --session --dest io.github.turbinebmw.Gaze --object-path /io/github/turbinebmw/Gaze/window/1 --method org.gtk.Actions.Activate shutter [] {}`

@@ -6,6 +6,7 @@ use crate::codes::{self, Code, Payload, Scanner};
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
+use crate::vcam;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
@@ -80,6 +81,9 @@ pub struct Window {
     text_chips: RefCell<Vec<gtk::Button>>,
     frozen: Cell<bool>,
     reading: Cell<bool>,
+    /// The virtual camera: wanted (the setting) and being set up.
+    virtual_on: Cell<bool>,
+    virtual_starting: Cell<bool>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -117,6 +121,8 @@ impl Window {
             text_chips: RefCell::new(Vec::new()),
             frozen: Cell::new(false),
             reading: Cell::new(false),
+            virtual_on: Cell::new(settings.virtual_camera),
+            virtual_starting: Cell::new(false),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -476,6 +482,19 @@ impl Window {
         ));
         window.add_action(&copy_all);
 
+        let virtual_camera = gio::SimpleAction::new_stateful(
+            "virtual-camera",
+            None,
+            &self.virtual_on.get().to_variant(),
+        );
+        virtual_camera.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.set_virtual_camera(!this.virtual_on.get())
+        ));
+        window.add_action(&virtual_camera);
+        app.set_accels_for_action("win.virtual-camera", &["<Control>v"]);
+
         let close_code = gio::SimpleAction::new("close-code", None);
         close_code.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
@@ -654,6 +673,9 @@ impl Window {
                 self.sync_stats_tap();
                 self.sync_scanner();
                 self.apply_effect_state();
+                if self.virtual_on.get() {
+                    self.start_virtual_camera();
+                }
                 self.ui.stack.set_visible_child_name("viewfinder");
                 self.update_shutter();
             }
@@ -1024,6 +1046,58 @@ impl Window {
         }
     }
 
+    /// Turn the virtual camera on (creating the device if needed) or off,
+    /// and remember the choice.
+    fn set_virtual_camera(self: &Rc<Self>, on: bool) {
+        self.virtual_on.set(on);
+        self.settings.borrow_mut().virtual_camera = on;
+        self.settings.borrow().save();
+        if let Some(action) = self.ui.window.lookup_action("virtual-camera") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&on.to_variant());
+            }
+        }
+        if on {
+            self.start_virtual_camera();
+        } else if let Some(camera) = self.camera.borrow().as_ref() {
+            camera.stop_output();
+        }
+    }
+
+    fn start_virtual_camera(self: &Rc<Self>) {
+        if self.virtual_starting.get() {
+            return;
+        }
+        if self.camera.borrow().as_ref().is_none_or(Camera::is_output) {
+            return;
+        }
+        self.virtual_starting.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let result = vcam::ensure().await.and_then(|device| {
+                if !this.virtual_on.get() {
+                    return Ok(None);
+                }
+                let camera = this.camera.borrow();
+                let camera = camera.as_ref().ok_or("no camera")?;
+                camera.start_output(&device).map(|_| Some(device))
+            });
+            this.virtual_starting.set(false);
+            match result {
+                Ok(Some(device)) => this.ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Virtual camera on: {} appears as “{}” in other apps",
+                    device.display(),
+                    vcam::LABEL
+                ))),
+                Ok(None) => {}
+                Err(error) => {
+                    this.ui.toasts.add_toast(adw::Toast::new(&error));
+                    this.set_virtual_camera(false);
+                }
+            }
+        });
+    }
+
     fn set_effect(&self, effect: Option<&'static Effect>) {
         if let Some(camera) = self.camera.borrow().as_ref() {
             if let Err(error) = camera.set_effect(effect) {
@@ -1131,6 +1205,15 @@ impl Window {
                 self.recording_since.set(None);
                 self.update_shutter();
                 self.toast_file("Video saved", path);
+            }
+            Event::OutputFailed(text) => {
+                if let Some(camera) = self.camera.borrow().as_ref() {
+                    camera.stop_output();
+                }
+                self.set_virtual_camera(false);
+                self.ui
+                    .toasts
+                    .add_toast(adw::Toast::new(&format!("Virtual camera stopped: {text}")));
             }
             Event::RecordingFailed(text) => {
                 if let Some(camera) = self.camera.borrow().as_ref() {
@@ -1368,6 +1451,7 @@ fn build_ui(app: &adw::Application) -> Ui {
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
     view.append(Some("Scan Codes"), Some("win.scan"));
+    view.append(Some("Virtual Camera"), Some("win.virtual-camera"));
     view.append(Some("Colour Statistics"), Some("win.stats"));
     menu.append_section(None, &view);
     let files = gio::Menu::new();

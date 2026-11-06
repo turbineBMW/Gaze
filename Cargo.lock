@@ -481,6 +481,7 @@ dependencies = [
  "gstreamer-video",
  "gtk4",
  "libadwaita",
+ "libc",
  "log",
  "ocrs",
  "rten",
