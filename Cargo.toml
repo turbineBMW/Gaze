@@ -13,9 +13,20 @@ gst-video = { package = "gstreamer-video", version = "0.25" }
 gst-app = { package = "gstreamer-app", version = "0.25" }
 log = "0.4"
 env_logger = "0.11"
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "multi_barcode_readers", "qrcode", "datamatrix", "oned", "aztec", "pdf417", "encoding_rs"] }
+async-channel = "2.5.0"
+ocrs = "0.13.1"
+rten = "0.26"
+libc = "0.2"
+gif = "0.14.2"
+rten-tensor = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The decoders and the text models are unusable unoptimised.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

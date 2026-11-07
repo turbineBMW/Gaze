@@ -20,61 +20,99 @@ ordered by value for effort; each one leaves the app working and shippable.
 
 ## Phase 2: QR codes and barcodes
 
-- Decode on the analysis tap with `rxing` (pure Rust) in a worker thread,
-  a few frames a second while "Scan codes" is on.
-- Outline the code on the overlay. Offer the payload with smart actions:
-  open URL, copy text, join Wi-Fi (`WIFI:` payloads through NetworkManager),
-  save vCard / iCal.
-- EAN, Code 128 and Data Matrix come free with the same decoder.
-- Debounce so one code produces one result.
+- [x] Decode on the analysis tap with `rxing` (pure Rust) in a worker
+      thread, five frames a second while "Scan Codes" is on.
+- [x] Outline the code on the overlay in the accent colour. A card offers
+      the payload with the right action: open a link, join Wi-Fi (`WIFI:`
+      payloads through `nmcli`), save a vCard or iCalendar event, copy.
+- [x] EAN, UPC, Code 128, Code 39, ITF, Data Matrix, Aztec and PDF417 come
+      with the same decoder.
+- [x] One code, one card: a code stays on the card until a different one
+      appears; a dismissed code stays dismissed until it leaves the frame.
 
 ## Phase 3: Text recognition with click-to-copy
 
-- A "Text" mode freezes the current frame, runs Tesseract in a worker
-  thread and lays semi-transparent buttons over each detected line at its
-  bounding box. Click copies the line; "Copy all" copies everything in
-  reading order. Freezing keeps the buttons still.
-- Pre-pass: greyscale, adaptive threshold, optional deskew.
-- Language picker from the installed tessdata.
-- Later: a live low-rate mode that highlights where text is; press to read.
+- [x] "Read Text" freezes the next full-size frame, runs it through ocrs
+      (pure Rust scene-text models, fetched once into `~/.cache/gaze/ocrs`,
+      12 MB) on a blocking thread, and lays a semi-transparent chip over
+      each line. Click copies the line; "Copy All" copies everything in
+      reading order; Done, Escape or the shutter go back to live.
+- [x] Chips follow the picture through resizes and mirroring.
+- [ ] A live low-rate mode that highlights where text is; press to read.
+- [ ] Other scripts: ocrs is Latin-only today. Tesseract behind the same
+      interface would add languages at the cost of C bindings.
 
 ## Phase 4: Photo Booth effects
 
-- `glupload ! gleffects ! gldownload` before the tee, so the preview, photos,
-  recordings and the virtual camera all get the effect. `gleffects` already
-  has mirror, squeeze, stretch, light tunnel, fisheye, twirl, bulge, square,
-  heat, sepia, x-ray, glow, sobel, blur.
-- A Photo Booth-style picker: a 3 by 3 grid of live thumbnails plus "None",
-  one page for distortions and one for colour effects.
-- Effects stay out of (or are called out in) the colour statistics.
+- [x] `glupload ! gleffects ! gldownload` swapped in before the tee under a
+      blocking pad probe, so the preview, photos, recordings, taps and (later)
+      the virtual camera all get the effect, and nothing is paid when it is
+      off.
+- [x] Sixteen effects from `gleffects`, named the Photo Booth way: Mirror,
+      Squeeze, Stretch, Light Tunnel, Fish Eye, Twirl, Bulge, Square; Sepia,
+      X-Pro, Thermal, X-Ray, Glow, Blur, Edges, Red Only.
+- [x] A picker popover with a grid of radio buttons over `win.effect`
+      (Ctrl+0 goes back to Normal).
+- [ ] Live thumbnails in the picker, like Photo Booth's pages.
+- Colour statistics measure the picture after the effect; worth a note on
+  the card.
 
 ## Phase 5: Virtual camera
 
-- "Output to virtual camera": a `v4l2sink` branch on the tee feeding a
-  v4l2loopback device, so Meet, Zoom and Chromium get Gaze's mirrored,
-  colour-correct, filtered picture.
-- Create and own the loopback device through the elevation dialog, or use
-  one that already exists.
+- [x] "Virtual Camera" (Ctrl+V): a `queue ! videoconvert ! v4l2sink` branch
+      on the tee feeds a v4l2loopback device named "Gaze" (YUY2, no sync),
+      so Meet, Zoom, Chromium and OBS get Gaze's colour-correct, filtered
+      picture. Remembered, and restarted when the camera changes.
+- [x] The device is created on demand: Gaze re-runs itself as root through
+      `pkexec` (`gaze --add-virtual-camera`) and asks the module for a new
+      device over `/dev/v4l2loopback`, exclusive-caps so it is only a camera
+      while fed. It lasts until reboot and is found again by name.
+- [ ] The output is not mirrored (video-call apps mirror their own
+      self-view); an option for the rare app that does not.
+- [ ] A modprobe snippet from `install.sh` so the device exists at boot
+      without a prompt.
 
 ## Phase 6: A complete camera app
 
-- Resolution and frame-rate picker from the camera's caps.
-- Camera controls where V4L2 exposes them: exposure, white balance,
-  brightness, contrast, zoom, focus; with reset.
-- Last-shot thumbnail that opens the file; a strip of this session's
-  captures.
-- Burst mode; pause and resume recording; microphone picker and live level
-  meter.
-- Rule-of-thirds grid, fullscreen, a compact always-on-top mirror mode.
-- Desktop notification with thumbnail on capture; copy to clipboard.
+- [x] Format submenu: the camera's raw sizes and frame rates, remembered
+      per camera; Automatic keeps the driver's pick up to 1080p.
+- [x] Camera controls where V4L2 exposes them (scales, switches, menus,
+      Reset to Defaults), read and set with the standard ioctls.
+- [x] Last-shot thumbnail opening a gallery of this session's captures;
+      Copy Photo puts the newest on the clipboard.
+- [x] Burst while the shutter is held; pause and resume recording with a
+      continuous file; Microphone submenu and a live level meter.
+- [x] Rule-of-thirds grid, fullscreen (F11), capture notifications when
+      Gaze is not focused, `app.quit` for scripts.
+- [x] Compact Mirror (Ctrl+K): just the picture, 480 px wide, floated
+      and pinned in the corner of its monitor through Hyprland's Lua
+      dispatch API; Escape or the corner button puts it back.
+- [x] Live thumbnails in the effects picker (a second small GL pipeline
+      while it is open).
+- [x] Keep Virtual Camera After Reboot: a oneshot system unit, installed
+      through pkexec, recreates the device at boot.
 
 ## Phase 7: Stretch
 
-- Document scan: find the page, perspective-correct, export PDF with a text
-  layer (pairs with Phase 3).
-- Time-lapse and GIF capture; motion-triggered capture.
-- Background blur or replacement (ONNX segmentation) and auto-framing from
-  face detection. These need a model runtime and are the heaviest items.
+- [x] Scan Document to PDF (Ctrl+Shift+D): the page is found, straightened
+      and saved as an A4 PDF with an invisible text layer from ocrs.
+- [x] Time-lapse recordings (5x to 120x) and motion-triggered capture.
+- [x] GIF capture: a third mode next to Photo and Video; up to eight
+      seconds at 480 px, 12 fps, looping.
+- [x] Blur Background (Ctrl+B): Robust Video Matting (MobileNetV3, 15 MB,
+      fetched on first use) through rten gives the person alpha at about
+      10 fps on three cores; every frame is composited over a blurred copy
+      of itself in a second pipeline slot, so photos, recordings and the
+      virtual camera get it too.
+- [x] Background: None, Blur, the Omarchy wallpaper, or any picture
+      (scaled to cover the frame), from the Background submenu.
+- Auto-framing is the ISP relay's job on the Surface.
+
+## Also done
+
+- `gaze --do ACTION [VALUE]` drives a running Gaze over D-Bus, for
+  Hyprland keybindings: `gaze --do shutter`, `gaze --do mode gif`,
+  `gaze --do effect twirl`, `gaze --do background-blur`, `gaze --do quit`.
 
 ## Also worth having
 

@@ -17,6 +17,48 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Background (menu): Blur (Ctrl+B), the Omarchy wallpaper, or any picture
+  behind you. A person matte from Robust Video Matting (15 MB, downloaded
+  on first use) keeps you sharp; the result goes into photos, recordings
+  and the virtual camera too.
+- Compact Mirror (Ctrl+K): a small always-on-top picture in the corner of
+  the screen, for checking yourself before a call; Escape brings the window
+  back.
+- GIF mode next to Photo and Video: up to eight seconds, looping, saved
+  beside the photos.
+- `gaze --do shutter` (or `mode gif`, `effect twirl`, `background-blur`,
+  `quit`, any window action) drives a running Gaze from a script or a
+  Hyprland keybinding.
+- Scan Document to PDF (Ctrl+Shift+D): finds the page in front of the
+  camera, straightens it, and saves an A4 PDF to `~/Documents` with the
+  recognised text as a selectable layer.
+- Time-lapse recordings (menu: 5× to 120×) and Motion Capture
+  (Ctrl+Shift+M): a photo whenever something moves.
+- Keep Virtual Camera After Reboot (menu): installs a small system service
+  so the "Gaze" device exists at boot without a prompt.
+- Format (menu): pick the camera's size and frame rate; remembered per
+  camera. Grid (Ctrl+G) and Fullscreen (F11).
+- Camera controls (Ctrl+Shift+K): whatever the driver exposes, as sliders,
+  switches and menus, with Reset to Defaults.
+- Gallery (Ctrl+Shift+G) behind the last-shot thumbnail; Copy Photo
+  (Ctrl+Shift+C). Hold the shutter for a burst.
+- Pause and resume a recording (Ctrl+P) without a gap in the file; pick the
+  microphone from the menu and watch its level while recording.
+- Virtual Camera (Ctrl+V): Gaze's picture, effects included, as a camera
+  named "Gaze" that Meet, Zoom, Chromium and OBS can pick. Needs the
+  v4l2loopback kernel module; the device is created the first time through
+  a polkit prompt and lasts until reboot.
+- Effects, the Photo Booth kind: Mirror, Squeeze, Stretch, Light Tunnel, Fish
+  Eye, Twirl, Bulge, Square, Sepia, X-Pro, Thermal, X-Ray, Glow, Blur, Edges,
+  Red Only. They are rendered on the GPU and go into photos and recordings
+  too. Ctrl+0 goes back to normal.
+- Read Text (Ctrl+Shift+T): freezes the picture and puts a chip over every
+  line of text it finds; click a chip to copy that line, or Copy All. The
+  recognition models (12 MB, pure Rust `ocrs`) are downloaded on first use
+  into `~/.cache/gaze/ocrs`.
+- Scan Codes (Ctrl+S): QR codes and barcodes are outlined as they are seen,
+  and a card offers what fits the payload: open a link, join a Wi-Fi
+  network, save a contact or event, copy the text.
 - Self-timer (3, 5 or 10 s; Ctrl+T cycles it) for photos and recordings, with
   a countdown on the picture. Escape or the shutter cancels.
 - Colour statistics (Ctrl+I): black and white level, mean level, saturation,
@@ -36,7 +78,7 @@ sh uninstall.sh
 ```
 
 Needs GTK ≥ 4.18, libadwaita ≥ 1.8 and GStreamer with: `gtk4paintablesink`
-(gst-plugin-gtk4), `v4l2src`, `mp4mux`, `pulsesrc` (gst-plugins-good),
+(gst-plugin-gtk4), `gleffects` (gst-plugins-base OpenGL), `v4l2src`, `mp4mux`, `pulsesrc` (gst-plugins-good),
 `vah264enc` (gst-plugin-va), `avenc_aac` (gst-libav). `install.sh` checks for
 all of them and prints the install command for what is missing.
 
