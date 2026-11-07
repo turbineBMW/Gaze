@@ -24,6 +24,11 @@ picture.viewfinder.mirrored { transform: scaleX(-1); }
 .flash { background-color: white; }
 .stats { padding: 12px 14px; border-radius: 12px; }
 .timer { padding: 6px 12px; border-radius: 999px; font-weight: bold; }
+label.countdown {
+  font-size: 160px; font-weight: 800; color: white;
+  text-shadow: 0 2px 24px rgb(0 0 0 / 70%);
+}
+menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
 /* Toasts sit above the shutter row instead of on it. */
 toast { margin-bottom: 100px; }
 button.shutter {
