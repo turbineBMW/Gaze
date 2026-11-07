@@ -17,6 +17,10 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Effects, the Photo Booth kind: Mirror, Squeeze, Stretch, Light Tunnel, Fish
+  Eye, Twirl, Bulge, Square, Sepia, X-Pro, Thermal, X-Ray, Glow, Blur, Edges,
+  Red Only. They are rendered on the GPU and go into photos and recordings
+  too. Ctrl+0 goes back to normal.
 - Scan Codes (Ctrl+S): QR codes and barcodes are outlined as they are seen,
   and a card offers what fits the payload: open a link, join a Wi-Fi
   network, save a contact or event, copy the text.
@@ -39,7 +43,7 @@ sh uninstall.sh
 ```
 
 Needs GTK ≥ 4.18, libadwaita ≥ 1.8 and GStreamer with: `gtk4paintablesink`
-(gst-plugin-gtk4), `v4l2src`, `mp4mux`, `pulsesrc` (gst-plugins-good),
+(gst-plugin-gtk4), `gleffects` (gst-plugins-base OpenGL), `v4l2src`, `mp4mux`, `pulsesrc` (gst-plugins-good),
 `vah264enc` (gst-plugin-va), `avenc_aac` (gst-libav). `install.sh` checks for
 all of them and prints the install command for what is missing.
 

@@ -1,7 +1,7 @@
 //! Cameras and the GStreamer pipeline behind the viewfinder.
 //!
 //! ```text
-//! source ! capsfilter (raw, system memory, <= 1080p) ! tee
+//! source ! capsfilter (raw, system memory, <= 1080p) ! effect ! tee
 //!   tee. ! queue (leaky) ! gtk4paintablesink                 viewfinder + photos
 //!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! capsfilter ! appsink (RGB)
 //!                                                              analysis taps
@@ -13,6 +13,10 @@
 //! consumer registers a [`Tap`] saying how large and how often it needs
 //! frames, and the branch is scaled and rate-limited to the most demanding
 //! one. The valve keeps it empty while nobody is tapping.
+//!
+//! `effect` is an `identity`, or a GL bin (`glupload ! gleffects !
+//! gldownload`) swapped in under a blocking pad probe, so photos, recordings
+//! and taps all see the effect.
 //!
 //! V4L2 cameras are opened directly with `v4l2src`, the way Chromium opens
 //! them; anything else (libcamera) through the PipeWire device's own element.
@@ -150,10 +154,55 @@ impl LatestFrame {
     }
 }
 
+/// A Photo Booth-style effect, done by `gleffects`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Effect {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Distortions warp the picture; the rest recolour it.
+    pub distorts: bool,
+    gl: &'static str,
+}
+
+const fn effect(id: &'static str, name: &'static str, distorts: bool) -> Effect {
+    Effect {
+        id,
+        name,
+        distorts,
+        gl: id,
+    }
+}
+
+pub const EFFECTS: &[Effect] = &[
+    effect("mirror", "Mirror", true),
+    effect("squeeze", "Squeeze", true),
+    effect("stretch", "Stretch", true),
+    effect("tunnel", "Light Tunnel", true),
+    effect("fisheye", "Fish Eye", true),
+    effect("twirl", "Twirl", true),
+    effect("bulge", "Bulge", true),
+    effect("square", "Square", true),
+    effect("sepia", "Sepia", false),
+    effect("xpro", "X-Pro", false),
+    effect("heat", "Thermal", false),
+    effect("xray", "X-Ray", false),
+    effect("glow", "Glow", false),
+    effect("blur", "Blur", false),
+    effect("sobel", "Edges", false),
+    effect("sin", "Red Only", false),
+];
+
+pub fn effect_by_id(id: &str) -> Option<&'static Effect> {
+    EFFECTS.iter().find(|e| e.id == id)
+}
+
 pub struct Camera {
     pipeline: gst::Pipeline,
     paintable: gdk::Paintable,
     preview: gst::Element,
+    filter: gst::Element,
+    /// What sits between the capsfilter and the tee, and which effect it is.
+    effect: std::cell::RefCell<(gst::Element, Option<&'static str>)>,
     tee: gst::Element,
     tap_valve: gst::Element,
     tap_rate: gst::Element,
@@ -195,6 +244,7 @@ impl Camera {
             .build();
         let filter = make("capsfilter")?;
         filter.set_property("caps", &caps);
+        let effect = make("identity")?;
         let tee = make("tee")?;
 
         let preview_queue = make("queue")?;
@@ -252,6 +302,7 @@ impl Camera {
         let elements = [
             &source,
             &filter,
+            &effect,
             &tee,
             &preview_queue,
             &preview,
@@ -264,7 +315,7 @@ impl Camera {
             tap_sink.upcast_ref(),
         ];
         pipeline.add_many(elements).map_err(|e| e.to_string())?;
-        gst::Element::link_many([&source, &filter, &tee]).map_err(|e| e.to_string())?;
+        gst::Element::link_many([&source, &filter, &effect, &tee]).map_err(|e| e.to_string())?;
         gst::Element::link_many([&tee, &preview_queue, &preview]).map_err(|e| e.to_string())?;
         gst::Element::link_many([
             &tee,
@@ -334,6 +385,8 @@ impl Camera {
             pipeline,
             paintable,
             preview,
+            filter,
+            effect: std::cell::RefCell::new((effect, None)),
             tee,
             tap_valve,
             tap_rate,
@@ -346,6 +399,59 @@ impl Camera {
 
     pub fn paintable(&self) -> gdk::Paintable {
         self.paintable.clone()
+    }
+
+    /// Put `effect` (or none) between the camera and the tee. The swap
+    /// happens on the streaming thread with the flow blocked, so no frame
+    /// is lost to the old element.
+    pub fn set_effect(&self, effect: Option<&'static Effect>) -> Result<(), String> {
+        let wanted = effect.map(|e| e.id);
+        if self.effect.borrow().1 == wanted {
+            return Ok(());
+        }
+        let new = match effect {
+            None => make("identity")?,
+            Some(effect) => {
+                if gst::ElementFactory::find("gleffects").is_none() {
+                    return Err("GStreamer's OpenGL effects (gleffects) are missing".into());
+                }
+                gst::parse::bin_from_description(
+                    &format!(
+                        "glupload ! glcolorconvert ! gleffects effect={} ! gldownload \
+                         ! capsfilter caps=video/x-raw",
+                        effect.gl
+                    ),
+                    true,
+                )
+                .map_err(|e| format!("cannot build the effect: {e}"))?
+                .upcast()
+            }
+        };
+        let (old, _) = self.effect.replace((new.clone(), wanted));
+        let pipeline = self.pipeline.clone();
+        let filter = self.filter.clone();
+        let tee = self.tee.clone();
+        let src_pad = self
+            .filter
+            .static_pad("src")
+            .ok_or("capsfilter has no src pad")?;
+        src_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_, _| {
+            filter.unlink(&old);
+            old.unlink(&tee);
+            let _ = old.set_state(gst::State::Null);
+            let _ = pipeline.remove(&old);
+            if let Err(error) = pipeline
+                .add(&new)
+                .map_err(|e| e.to_string())
+                .and_then(|_| filter.link(&new).map_err(|e| e.to_string()))
+                .and_then(|_| new.link(&tee).map_err(|e| e.to_string()))
+                .and_then(|_| new.sync_state_with_parent().map_err(|e| e.to_string()))
+            {
+                log::warn!("effect swap: {error}");
+            }
+            gst::PadProbeReturn::Remove
+        });
+        Ok(())
     }
 
     /// Start handing frames to `handler` (on the streaming thread). The

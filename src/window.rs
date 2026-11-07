@@ -1,7 +1,7 @@
 //! The main window: viewfinder, shutter, camera picker, the colour
 //! statistics card and the code scanner's card.
 
-use crate::camera::{self, Camera, CameraInfo, Event, LatestFrame, Tap, TapId};
+use crate::camera::{self, Camera, CameraInfo, Effect, Event, LatestFrame, Tap, TapId, EFFECTS};
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
@@ -68,6 +68,7 @@ pub struct Window {
     shown_code: RefCell<Option<(Code, Payload)>>,
     /// A dismissed code's text: not shown again until it leaves the frame.
     dismissed_code: RefCell<Option<String>>,
+    effect: Cell<Option<&'static Effect>>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -100,6 +101,7 @@ impl Window {
             codes: RefCell::new(Vec::new()),
             shown_code: RefCell::new(None),
             dismissed_code: RefCell::new(None),
+            effect: Cell::new(None),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -146,6 +148,16 @@ impl Window {
                 };
                 this.mode.set(mode);
                 this.update_shutter();
+                if let Some(action) = this.ui.window.lookup_action("mode") {
+                    if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                        let name = if mode == Mode::Video {
+                            "video"
+                        } else {
+                            "photo"
+                        };
+                        action.set_state(&name.to_variant());
+                    }
+                }
             }
         ));
         ui.cameras_dropdown.connect_selected_notify(glib::clone!(
@@ -311,6 +323,23 @@ impl Window {
         window.add_action(&shutter);
         app.set_accels_for_action("win.shutter", &["space", "Return"]);
 
+        // Photo or video, by name: what the toggle at the bottom left does.
+        let mode = gio::SimpleAction::new_stateful(
+            "mode",
+            Some(glib::VariantTy::STRING),
+            &"photo".to_variant(),
+        );
+        mode.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                if let Some(name @ ("photo" | "video")) = value.and_then(|v| v.str()) {
+                    this.ui.mode_toggle.set_active_name(Some(name));
+                }
+            }
+        ));
+        window.add_action(&mode);
+
         // Start or stop a recording from any mode.
         let record = gio::SimpleAction::new("record", None);
         record.connect_activate(glib::clone!(
@@ -377,6 +406,23 @@ impl Window {
         ));
         window.add_action(&scan);
         app.set_accels_for_action("win.scan", &["<Control>s"]);
+
+        // Effects: a radio over EFFECTS by id, "none" for the plain picture.
+        let effect = gio::SimpleAction::new_stateful(
+            "effect",
+            Some(glib::VariantTy::STRING),
+            &"none".to_variant(),
+        );
+        effect.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                let id = value.and_then(|v| v.str()).unwrap_or("none");
+                this.set_effect(camera::effect_by_id(id));
+            }
+        ));
+        window.add_action(&effect);
+        app.set_accels_for_action("win.effect::none", &["<Control>0"]);
 
         let close_code = gio::SimpleAction::new("close-code", None);
         close_code.connect_activate(glib::clone!(
@@ -544,9 +590,14 @@ impl Window {
                 self.ui.picture.set_paintable(Some(&paintable));
                 self.stats_tap.set(None);
                 self.scanner.replace(None);
+                if let Err(error) = camera.set_effect(self.effect.get()) {
+                    log::warn!("{error}");
+                    self.effect.set(None);
+                }
                 self.camera.replace(Some(camera));
                 self.sync_stats_tap();
                 self.sync_scanner();
+                self.apply_effect_state();
                 self.ui.stack.set_visible_child_name("viewfinder");
                 self.update_shutter();
             }
@@ -776,6 +827,26 @@ impl Window {
         self.settings.borrow_mut().timer = secs;
         self.settings.borrow().save();
         self.apply_timer();
+    }
+
+    fn set_effect(&self, effect: Option<&'static Effect>) {
+        if let Some(camera) = self.camera.borrow().as_ref() {
+            if let Err(error) = camera.set_effect(effect) {
+                self.ui.toasts.add_toast(adw::Toast::new(&error));
+                return;
+            }
+        }
+        self.effect.set(effect);
+        self.apply_effect_state();
+    }
+
+    fn apply_effect_state(&self) {
+        let id = self.effect.get().map_or("none", |e| e.id);
+        if let Some(action) = self.ui.window.lookup_action("effect") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&id.to_variant());
+            }
+        }
     }
 
     fn apply_timer(&self) {
@@ -1325,6 +1396,7 @@ fn build_ui(app: &adw::Application) -> Ui {
         .build();
     left.append(&mode_toggle);
     left.append(&timer_button);
+    left.append(&effects_button());
     controls.set_start_widget(Some(&left));
     controls.set_center_widget(Some(&shutter));
     let scan_button = gtk::ToggleButton::builder()
@@ -1431,6 +1503,67 @@ async fn run(argv: &[&str]) -> Result<(), String> {
         let stderr = stderr.map(|s| s.to_string()).unwrap_or_default();
         Err(stderr.trim().lines().last().unwrap_or("failed").to_string())
     }
+}
+
+/// The effects picker: a popover with a grid of radio buttons over
+/// win.effect, distortions first, then colours, like Photo Booth's pages.
+fn effects_button() -> gtk::MenuButton {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let tile = |label: &str, id: &str| {
+        let button = gtk::ToggleButton::builder()
+            .label(label)
+            .action_name("win.effect")
+            .action_target(&id.to_variant())
+            .build();
+        button.add_css_class("flat");
+        button
+    };
+    let none = tile("Normal", "none");
+    none.set_halign(gtk::Align::Fill);
+    content.append(&none);
+    for (title, distorts) in [("Distort", true), ("Colour", false)] {
+        let heading = gtk::Label::builder().label(title).xalign(0.0).build();
+        heading.add_css_class("heading");
+        heading.add_css_class("dim-label");
+        content.append(&heading);
+        let grid = gtk::Grid::builder()
+            .row_spacing(4)
+            .column_spacing(4)
+            .column_homogeneous(true)
+            .build();
+        for (i, effect) in EFFECTS
+            .iter()
+            .filter(|e| e.distorts == distorts)
+            .enumerate()
+        {
+            grid.attach(
+                &tile(effect.name, effect.id),
+                (i % 3) as i32,
+                (i / 3) as i32,
+                1,
+                1,
+            );
+        }
+        content.append(&grid);
+    }
+    let popover = gtk::Popover::builder().child(&content).build();
+    popover.add_css_class("effects");
+    let button = gtk::MenuButton::builder()
+        .icon_name("color-select-symbolic")
+        .popover(&popover)
+        .tooltip_text("Effects")
+        .valign(gtk::Align::Center)
+        .build();
+    button.add_css_class("osd");
+    button.add_css_class("circular");
+    button
 }
 
 fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
