@@ -383,8 +383,9 @@ pub struct Camera {
     preview: gst::Element,
     /// What sits between the capsfilter and the tee, and which effect it is.
     effect: std::cell::RefCell<(gst::Element, Option<&'static str>)>,
-    /// The background slot after it, and whether blur is on.
-    background: std::cell::RefCell<(gst::Element, bool)>,
+    /// The background slot after it, and the backdrop its matting threads
+    /// composite over while it is on.
+    background: std::cell::RefCell<(gst::Element, Option<Arc<Mutex<crate::matte::Backdrop>>>)>,
     tee: gst::Element,
     tap_valve: gst::Element,
     tap_rate: gst::Element,
@@ -639,7 +640,7 @@ impl Camera {
             paintable,
             preview,
             effect: std::cell::RefCell::new((effect, None)),
-            background: std::cell::RefCell::new((background, false)),
+            background: std::cell::RefCell::new((background, None)),
             tee,
             tap_valve,
             tap_rate,
@@ -725,23 +726,28 @@ impl Camera {
         Ok(())
     }
 
-    pub fn background_blur(&self) -> bool {
-        self.background.borrow().1
-    }
-
-    /// Blur the background behind the person (the matting model must be
-    /// in the cache), or stop doing so.
-    pub fn set_background_blur(&self, on: bool) -> Result<(), String> {
-        if self.background.borrow().1 == on {
-            return Ok(());
+    /// Put `backdrop` behind the person (the matting model must be in the
+    /// cache), change it, or with `None` show the plain picture again.
+    pub fn set_background(&self, backdrop: Option<crate::matte::Backdrop>) -> Result<(), String> {
+        let current = self.background.borrow().1.clone();
+        match (backdrop, current) {
+            (None, None) => Ok(()),
+            (Some(backdrop), Some(shared)) => {
+                *shared.lock().unwrap_or_else(|e| e.into_inner()) = backdrop;
+                Ok(())
+            }
+            (Some(backdrop), None) => {
+                let shared = Arc::new(Mutex::new(backdrop));
+                let new: gst::Element = background_bin(shared.clone())?.upcast();
+                let (old, _) = self.background.replace((new.clone(), Some(shared)));
+                self.swap_slot(old, new)
+            }
+            (None, Some(_)) => {
+                let new = make("identity")?;
+                let (old, _) = self.background.replace((new.clone(), None));
+                self.swap_slot(old, new)
+            }
         }
-        let new: gst::Element = if on {
-            background_bin()?.upcast()
-        } else {
-            make("identity")?
-        };
-        let (old, _) = self.background.replace((new.clone(), on));
-        self.swap_slot(old, new)
     }
 
     /// Start handing frames to `handler` (on the streaming thread). The
@@ -1124,7 +1130,7 @@ impl Camera {
 
 /// The background blur slot: frames leave the pipeline through an appsink
 /// into the matting threads and come back through an appsrc, composited.
-fn background_bin() -> Result<gst::Bin, String> {
+fn background_bin(backdrop: Arc<Mutex<crate::matte::Backdrop>>) -> Result<gst::Bin, String> {
     let bin = gst::Bin::new();
     let convert = make("videoconvert")?;
     let to_rgb = make("capsfilter")?;
@@ -1169,7 +1175,7 @@ fn background_bin() -> Result<gst::Bin, String> {
     // frames out can carry it.
     let rate: Arc<Mutex<gst::Fraction>> = Arc::new(Mutex::new(gst::Fraction::new(30, 1)));
     let out_caps: Arc<Mutex<Option<(usize, usize)>>> = Arc::default();
-    let matting = Arc::new(crate::matte::Matting::start({
+    let matting = Arc::new(crate::matte::Matting::start(backdrop, {
         let src = src.clone();
         let rate = rate.clone();
         move |frame: Frame| {

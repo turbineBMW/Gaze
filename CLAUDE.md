@@ -36,6 +36,8 @@ src/scan.rs      document scan: Otsu + largest region -> quad, homography warp,
                  hand-written PDF with a JPEG page and an invisible text layer
 src/motion.rs    frame-difference motion score (tested)
 src/gifcap.rs    GIF mode: frames from a tap, encoded with the gif crate
+src/hypr.rs      Hyprland 0.56 Lua dispatch (hl.dsp.window.float/resize/move/pin by
+                 pid) for the compact mirror; a no-op elsewhere
 src/matte.rs     background blur: RVM through rten on a matting thread (throttled to
                  10 fps, 3-thread pool), fixed-point composite thread; model in ~/.cache/gaze/rvm
 src/thumbs.rs    live effect thumbnails: appsrc -> glupload -> tee -> gleffects x16
@@ -43,7 +45,7 @@ src/stats.rs     colour statistics of an RGB frame (unit-tested)
 src/omarchy.rs   Omarchy colors.toml -> libadwaita CSS (port of Rustle's; tested)
 src/theme.rs     applies it and follows theme changes live
 src/settings.rs  ~/.config/gaze/settings (camera, mirror, timer, virtual_camera,
-                 grid, mic, lapse, background_blur, format.<camera>)
+                 grid, mic, lapse, background (none|blur|path), format.<camera>)
 docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
 ```
 
@@ -80,6 +82,10 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
   the recorder; bus errors from inside it become `Event::OutputFailed` and
   only that branch is dropped. The loopback device is exclusive-caps, so
   readers fail to open it while Gaze is not feeding it: expected.
+- Hyprland 0.56's `hyprctl dispatch` takes a Lua expression, not the old
+  `dispatcher args` text: `hl.dsp.window.resize({ x = 480, y = 270, exact =
+  true, window = hl.get_window('pid:N') })`. The stubs in
+  /usr/share/hypr/stubs/hl.meta.lua list the API.
 - `gaze --do ACTION [VALUE]` is the scripted way in (main.rs builds the
   `(sava{sv})` Activate call). Window actions are on D-Bus at `/io/github/turbinebmw/Gaze/window/1`
   (`org.gtk.Actions.Activate`), handy for scripted tests:

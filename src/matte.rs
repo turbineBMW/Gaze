@@ -82,6 +82,15 @@ pub async fn download_model() -> Result<(), String> {
     std::fs::rename(&partial, &target).map_err(|e| e.to_string())
 }
 
+/// What goes behind the person.
+#[derive(Clone)]
+pub enum Backdrop {
+    /// The frame itself, blurred.
+    Blur,
+    /// A picture, scaled to cover the frame.
+    Image(Arc<Frame>),
+}
+
 /// A person alpha matte, `width` by `height`, 0 (background) to 255.
 #[derive(Clone)]
 pub struct Alpha {
@@ -140,8 +149,12 @@ pub struct Matting {
 }
 
 impl Matting {
-    /// Load the model and start; composited frames go to `output`.
-    pub fn start(output: impl Fn(Frame) + Send + 'static) -> Result<Self, String> {
+    /// Load the model and start; composited frames go to `output`, over
+    /// whatever `backdrop` holds at the time.
+    pub fn start(
+        backdrop: Arc<Mutex<Backdrop>>,
+        output: impl Fn(Frame) + Send + 'static,
+    ) -> Result<Self, String> {
         let model = rten::Model::load_file(model_dir().join(MODEL_NAME))
             .map_err(|e| format!("cannot load the matting model: {e}"))?;
         let frames: Arc<Slot<Frame>> = Arc::default();
@@ -228,12 +241,35 @@ impl Matting {
             thread::Builder::new()
                 .name("gaze-composite".into())
                 .spawn(move || {
+                    // A picture backdrop scaled to the frame, kept per
+                    // picture and size.
+                    let mut scaled: Option<(*const Frame, usize, usize, Vec<u8>)> = None;
                     while let Some(frame) = frames.take() {
                         model_frames.put(frame.clone());
                         let current = alpha.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        let out = match current {
-                            Some(alpha) => composite(&frame, &alpha),
-                            None => frame,
+                        let Some(alpha) = current else {
+                            output(frame);
+                            continue;
+                        };
+                        let backdrop = backdrop.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let out = match backdrop {
+                            Backdrop::Blur => composite(&frame, &alpha),
+                            Backdrop::Image(image) => {
+                                let key = (Arc::as_ptr(&image), frame.width, frame.height);
+                                if scaled
+                                    .as_ref()
+                                    .is_none_or(|(p, w, h, _)| (*p, *w, *h) != key)
+                                {
+                                    scaled = Some((
+                                        key.0,
+                                        key.1,
+                                        key.2,
+                                        cover(&image, frame.width, frame.height),
+                                    ));
+                                }
+                                let background = &scaled.as_ref().expect("just set").3;
+                                composite_over(&frame, &alpha, background)
+                            }
                         };
                         output(out);
                     }
@@ -304,6 +340,77 @@ fn taps(dst_len: usize, src_len: usize) -> Taps {
         t.f.push(((s - i0 as f64) * 256.0) as u32);
     }
     t
+}
+
+/// `image` scaled (bilinear) and cropped to cover `w` by `h`, packed RGB.
+pub fn cover(image: &Frame, w: usize, h: usize) -> Vec<u8> {
+    let scale = (w as f64 / image.width as f64).max(h as f64 / image.height as f64);
+    let (sw, sh) = (image.width as f64 * scale, image.height as f64 * scale);
+    let (ox, oy) = ((sw - w as f64) / 2.0, (sh - h as f64) / 2.0);
+    let mut out = vec![0u8; w * h * 3];
+    let xs: Vec<(usize, usize, u32)> = (0..w)
+        .map(|x| {
+            let s = ((x as f64 + ox + 0.5) / scale - 0.5).clamp(0.0, (image.width - 1) as f64);
+            let i0 = s.floor() as usize;
+            (
+                i0,
+                (i0 + 1).min(image.width - 1),
+                ((s - i0 as f64) * 256.0) as u32,
+            )
+        })
+        .collect();
+    for y in 0..h {
+        let s = ((y as f64 + oy + 0.5) / scale - 0.5).clamp(0.0, (image.height - 1) as f64);
+        let y0 = s.floor() as usize;
+        let y1 = (y0 + 1).min(image.height - 1);
+        let fy = ((s - y0 as f64) * 256.0) as u32;
+        let (r0, r1) = (
+            &image.rgb[y0 * image.stride..],
+            &image.rgb[y1 * image.stride..],
+        );
+        let dst = &mut out[y * w * 3..][..w * 3];
+        for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
+            for c in 0..3 {
+                let top = r0[x0 * 3 + c] as u32 * (256 - fx) + r0[x1 * 3 + c] as u32 * fx;
+                let bottom = r1[x0 * 3 + c] as u32 * (256 - fx) + r1[x1 * 3 + c] as u32 * fx;
+                dst[x * 3 + c] = ((top * (256 - fy) + bottom * fy) >> 16) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The frame over a full-size packed RGB `background`, by the alpha.
+pub fn composite_over(frame: &Frame, alpha: &Alpha, background: &[u8]) -> Frame {
+    let (w, h) = (frame.width, frame.height);
+    let (ax, ay) = (taps(w, alpha.width), taps(h, alpha.height));
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        let src = &frame.rgb[y * frame.stride..][..w * 3];
+        let bg = &background[y * w * 3..][..w * 3];
+        let dst = &mut rgb[y * w * 3..][..w * 3];
+        let (a_row0, a_row1, a_fy) = (
+            &alpha.data[ay.i0[y] * alpha.width..][..alpha.width],
+            &alpha.data[ay.i1[y] * alpha.width..][..alpha.width],
+            ay.f[y],
+        );
+        for x in 0..w {
+            let (x0, x1, fx) = (ax.i0[x], ax.i1[x], ax.f[x]);
+            let top = a_row0[x0] as u32 * (256 - fx) + a_row0[x1] as u32 * fx;
+            let bottom = a_row1[x0] as u32 * (256 - fx) + a_row1[x1] as u32 * fx;
+            let a = (top * (256 - a_fy) + bottom * a_fy) >> 16;
+            for c in 0..3 {
+                let f = src[x * 3 + c] as u32;
+                dst[x * 3 + c] = ((f * a + bg[x * 3 + c] as u32 * (255 - a)) / 255) as u8;
+            }
+        }
+    }
+    Frame {
+        rgb,
+        width: w,
+        height: h,
+        stride: w * 3,
+    }
 }
 
 /// The frame with its background blurred, by the alpha.
@@ -508,6 +615,39 @@ mod tests {
             composite(&frame, &alpha);
         }
         eprintln!("composite 1080p: {:?} per frame", started.elapsed() / 10);
+    }
+
+    #[test]
+    fn cover_scales_and_crops_to_the_frame() {
+        // A 4x2 image: left half red, right half blue.
+        let image = Frame {
+            rgb: vec![255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255].repeat(2),
+            width: 4,
+            height: 2,
+            stride: 12,
+        };
+        // A square frame crops the sides: the centre of the image stays.
+        let out = cover(&image, 8, 8);
+        assert_eq!(out.len(), 8 * 8 * 3);
+        assert!(out[0] > 200 && out[2] < 60, "left is red: {:?}", &out[..3]);
+        assert!(
+            out[7 * 3 + 2] > 200,
+            "right is blue: {:?}",
+            &out[7 * 3..8 * 3]
+        );
+        let alpha = Alpha {
+            data: vec![0; 4],
+            width: 2,
+            height: 2,
+        };
+        let frame = Frame {
+            rgb: vec![0; 8 * 8 * 3],
+            width: 8,
+            height: 8,
+            stride: 24,
+        };
+        let composed = composite_over(&frame, &alpha, &out);
+        assert_eq!(&composed.rgb[..3], &out[..3]);
     }
 
     #[test]
