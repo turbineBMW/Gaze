@@ -1,14 +1,17 @@
 //! The main window: viewfinder, shutter, camera picker, the colour
 //! statistics card and the code scanner's card.
 
-use crate::camera::{self, Camera, CameraInfo, Effect, Event, LatestFrame, Tap, TapId, EFFECTS};
+use crate::camera::{
+    self, Camera, CameraInfo, Effect, Event, Format, LatestFrame, Tap, TapId, EFFECTS,
+};
 use crate::codes::{self, Code, Payload, Scanner};
+use crate::controls;
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
 use crate::vcam;
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -19,6 +22,15 @@ enum Mode {
     Photo,
     Video,
 }
+
+/// A photo or recording made this session, for the gallery.
+struct Capture {
+    path: PathBuf,
+    video: bool,
+}
+
+/// How many the gallery keeps.
+const GALLERY_SIZE: usize = 24;
 
 struct Ui {
     window: adw::ApplicationWindow,
@@ -48,6 +60,20 @@ struct Ui {
     mode_toggle: adw::ToggleGroup,
     timer: gtk::Label,
     flash: gtk::Box,
+    toolbar: adw::ToolbarView,
+    /// The Format submenu, refilled for each camera.
+    formats_menu: gio::Menu,
+    /// The Microphone submenu, refilled with the cameras.
+    mics_menu: gio::Menu,
+    pause_button: gtk::ToggleButton,
+    level: gtk::LevelBar,
+    /// The last capture, and the gallery popover behind it.
+    thumb_button: gtk::MenuButton,
+    thumb_picture: gtk::Picture,
+    gallery: gtk::FlowBox,
+    /// The camera controls popover's content, rebuilt per camera.
+    controls_box: gtk::Box,
+    controls_button: gtk::MenuButton,
 }
 
 pub struct Window {
@@ -84,6 +110,19 @@ pub struct Window {
     /// The virtual camera: wanted (the setting) and being set up.
     virtual_on: Cell<bool>,
     virtual_starting: Cell<bool>,
+    grid: Cell<bool>,
+    captures: RefCell<Vec<Capture>>,
+    /// The frame a recording started on, for its gallery entry.
+    recording_thumb: RefCell<Option<camera::Frame>>,
+    /// A burst in progress: its ticking source and how many so far.
+    burst: RefCell<Option<glib::SourceId>>,
+    burst_count: Cell<u32>,
+    /// Time the current recording has spent paused, and since when if it
+    /// is paused now.
+    paused_total: Cell<Duration>,
+    paused_at: Cell<Option<Instant>>,
+    /// The open camera's V4L2 node, for its controls.
+    device_path: RefCell<Option<PathBuf>>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -123,6 +162,14 @@ impl Window {
             reading: Cell::new(false),
             virtual_on: Cell::new(settings.virtual_camera),
             virtual_starting: Cell::new(false),
+            grid: Cell::new(settings.grid),
+            captures: RefCell::new(Vec::new()),
+            recording_thumb: RefCell::new(None),
+            burst: RefCell::new(None),
+            burst_count: Cell::new(0),
+            paused_total: Cell::new(Duration::ZERO),
+            paused_at: Cell::new(None),
+            device_path: RefCell::new(None),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -157,6 +204,50 @@ impl Window {
             #[weak(rename_to = this)]
             self,
             move |_| this.shutter()
+        ));
+        // Hold the shutter for a burst (photo mode): claiming the sequence
+        // keeps the release from counting as a click too.
+        let hold = gtk::GestureLongPress::new();
+        hold.set_propagation_phase(gtk::PropagationPhase::Capture);
+        hold.connect_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |gesture, _, _| {
+                if this.mode.get() == Mode::Photo
+                    && !this.counting_down()
+                    && !this.frozen.get()
+                    && this.camera.borrow().is_some()
+                {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    this.start_burst();
+                }
+            }
+        ));
+        hold.connect_end(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.stop_burst()
+        ));
+        hold.connect_cancelled(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.stop_burst()
+        ));
+        ui.shutter.add_controller(hold);
+        ui.gallery.connect_child_activated(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, child| {
+                let index = child.index();
+                let path = {
+                    let captures = this.captures.borrow();
+                    (index >= 0).then(|| captures.get(index as usize).map(|c| c.path.clone()))
+                };
+                if let Some(Some(path)) = path {
+                    this.ui.thumb_button.popdown();
+                    open_file(&path);
+                }
+            }
         ));
         ui.mode_toggle.connect_active_name_notify(glib::clone!(
             #[weak(rename_to = this)]
@@ -276,6 +367,18 @@ impl Window {
                     }
                 }
                 drop(codes);
+                if this.grid.get() {
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
+                    cr.set_line_width(1.0);
+                    for i in 1..3 {
+                        let f = i as f64 / 3.0;
+                        cr.move_to(vx + f * vw, vy);
+                        cr.line_to(vx + f * vw, vy + vh);
+                        cr.move_to(vx, vy + f * vh);
+                        cr.line_to(vx + vw, vy + f * vh);
+                    }
+                    let _ = cr.stroke();
+                }
                 if !this.stats_on.get() {
                     return;
                 }
@@ -495,6 +598,40 @@ impl Window {
         window.add_action(&virtual_camera);
         app.set_accels_for_action("win.virtual-camera", &["<Control>v"]);
 
+        // The session's gallery, from the keyboard.
+        let gallery = gio::SimpleAction::new("gallery", None);
+        gallery.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                if this.ui.thumb_button.is_visible() {
+                    this.ui.thumb_button.popup();
+                }
+            }
+        ));
+        window.add_action(&gallery);
+        app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
+
+        // The camera controls popover, from the keyboard.
+        let controls_action = gio::SimpleAction::new("controls", None);
+        controls_action.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.ui.controls_button.popup()
+        ));
+        window.add_action(&controls_action);
+        app.set_accels_for_action("win.controls", &["<Control><Shift>k"]);
+
+        // Copy the last photo to the clipboard.
+        let copy_last = gio::SimpleAction::new("copy-last", None);
+        copy_last.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.copy_last_photo()
+        ));
+        window.add_action(&copy_last);
+        app.set_accels_for_action("win.copy-last", &["<Control><Shift>c"]);
+
         let close_code = gio::SimpleAction::new("close-code", None);
         close_code.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
@@ -547,18 +684,124 @@ impl Window {
         window.add_action(&cycle);
         app.set_accels_for_action("win.cycle-timer", &["<Control>t"]);
 
-        // Escape stops a countdown.
+        // Escape stops a countdown, leaves text mode, leaves fullscreen.
         let cancel = gio::SimpleAction::new("cancel", None);
         cancel.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move |_, _| {
-                this.cancel_countdown();
-                this.unfreeze();
+                if this.counting_down() {
+                    this.cancel_countdown();
+                } else if this.frozen.get() || this.reading.get() {
+                    this.unfreeze();
+                } else if this.ui.window.is_fullscreen() {
+                    this.ui.window.unfullscreen();
+                }
             }
         ));
         window.add_action(&cancel);
         app.set_accels_for_action("win.cancel", &["Escape"]);
+
+        // Pause and resume the recording.
+        let pause = gio::SimpleAction::new_stateful("pause", None, &false.to_variant());
+        pause.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.toggle_pause()
+        ));
+        window.add_action(&pause);
+        app.set_accels_for_action("win.pause", &["<Control>p"]);
+
+        // The microphone: "default" or a PipeWire node name.
+        let mic = gio::SimpleAction::new_stateful(
+            "mic",
+            Some(glib::VariantTy::STRING),
+            &self
+                .settings
+                .borrow()
+                .mic
+                .clone()
+                .unwrap_or_else(|| "default".into())
+                .to_variant(),
+        );
+        mic.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, value| {
+                let id = value.and_then(|v| v.str()).unwrap_or("default");
+                action.set_state(&id.to_variant());
+                this.settings.borrow_mut().mic = Some(id.to_string()).filter(|m| m != "default");
+                this.settings.borrow().save();
+            }
+        ));
+        window.add_action(&mic);
+
+        // The camera's format: "auto" or a Format id, remembered per camera.
+        let format = gio::SimpleAction::new_stateful(
+            "format",
+            Some(glib::VariantTy::STRING),
+            &"auto".to_variant(),
+        );
+        format.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                let id = value.and_then(|v| v.str()).unwrap_or("auto");
+                let Some(name) = this.current_camera_name() else {
+                    return;
+                };
+                let chosen = Some(id).filter(|id| *id != "auto");
+                this.settings.borrow_mut().set_format(&name, chosen);
+                this.settings.borrow().save();
+                this.open_selected();
+            }
+        ));
+        window.add_action(&format);
+
+        let grid = gio::SimpleAction::new_stateful("grid", None, &self.grid.get().to_variant());
+        grid.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let on = !this.grid.get();
+                this.grid.set(on);
+                action.set_state(&on.to_variant());
+                this.settings.borrow_mut().grid = on;
+                this.settings.borrow().save();
+                this.ui.overlay.queue_draw();
+            }
+        ));
+        window.add_action(&grid);
+        app.set_accels_for_action("win.grid", &["<Control>g"]);
+
+        let fullscreen = gio::SimpleAction::new_stateful("fullscreen", None, &false.to_variant());
+        fullscreen.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                if this.ui.window.is_fullscreen() {
+                    this.ui.window.unfullscreen();
+                } else {
+                    this.ui.window.fullscreen();
+                }
+            }
+        ));
+        window.add_action(&fullscreen);
+        app.set_accels_for_action("win.fullscreen", &["F11"]);
+        // The header bar goes with the window chrome.
+        window.connect_fullscreened_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |window| {
+                let full = window.is_fullscreen();
+                this.ui.toolbar.set_reveal_top_bars(!full);
+                if let Some(action) = window.lookup_action("fullscreen") {
+                    if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                        action.set_state(&full.to_variant());
+                    }
+                }
+            }
+        ));
 
         for (name, dir) in [("open-photos", photos_dir()), ("open-videos", videos_dir())] {
             let action = gio::SimpleAction::new(name, None);
@@ -594,7 +837,7 @@ impl Window {
             }
         ));
         window.add_action(&about);
-        app.set_accels_for_action("window.close", &["<Control>w", "<Control>q"]);
+        app.set_accels_for_action("window.close", &["<Control>w"]);
     }
 
     fn refresh_cameras(self: &Rc<Self>) {
@@ -610,6 +853,7 @@ impl Window {
             camera.close();
         }
         let cameras = camera::list();
+        self.fill_mics_menu();
         let names: Vec<&str> = cameras.iter().map(|c| c.name.as_str()).collect();
         let model = gtk::StringList::new(&names);
         let wanted = self.settings.borrow().camera.clone();
@@ -653,15 +897,28 @@ impl Window {
         let Some(info) = cameras.get(index) else {
             return;
         };
+        let format = self
+            .settings
+            .borrow()
+            .format_for(&info.name)
+            .and_then(Format::parse)
+            .filter(|f| info.formats.contains(f));
+        self.fill_formats_menu(info, format.as_ref());
+        self.device_path.replace(info.device_path());
+        self.fill_controls();
         let weak = Rc::downgrade(self);
-        match Camera::open(info, move |event| {
+        match Camera::open(info, format.as_ref(), move |event| {
             if let Some(this) = weak.upgrade() {
                 this.on_event(event);
             }
         }) {
             Ok(camera) => {
                 let paintable = camera.paintable();
-                log::info!("opened {}", info.name);
+                log::info!(
+                    "opened {} ({})",
+                    info.name,
+                    format.as_ref().map_or("auto".into(), Format::label)
+                );
                 self.ui.picture.set_paintable(Some(&paintable));
                 self.stats_tap.set(None);
                 self.scanner.replace(None);
@@ -680,6 +937,199 @@ impl Window {
                 self.update_shutter();
             }
             Err(error) => self.show_status("Camera Unavailable", &error),
+        }
+    }
+
+    /// The Microphone submenu: Default plus each microphone, as radio items
+    /// over win.mic.
+    fn fill_mics_menu(&self) {
+        let menu = &self.ui.mics_menu;
+        menu.remove_all();
+        let item = gio::MenuItem::new(Some("Default"), None);
+        item.set_action_and_target_value(Some("win.mic"), Some(&"default".to_variant()));
+        menu.append_item(&item);
+        for mic in camera::mics() {
+            let item = gio::MenuItem::new(Some(&mic.name), None);
+            item.set_action_and_target_value(Some("win.mic"), Some(&mic.device.to_variant()));
+            menu.append_item(&item);
+        }
+    }
+
+    fn toggle_pause(&self) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref().filter(|c| c.is_recording()) else {
+            return;
+        };
+        if self.recording_since.get().is_none() {
+            return; // stopping already
+        }
+        let paused = !camera.is_paused();
+        if paused {
+            camera.pause_recording();
+            self.paused_at.set(Some(Instant::now()));
+        } else {
+            camera.resume_recording();
+            if let Some(at) = self.paused_at.take() {
+                self.paused_total
+                    .set(self.paused_total.get() + at.elapsed());
+            }
+        }
+        if let Some(action) = self.ui.window.lookup_action("pause") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&paused.to_variant());
+            }
+        }
+        self.ui.pause_button.set_active(paused);
+        self.ui.shutter.set_tooltip_text(Some(if paused {
+            "Stop Recording (paused)"
+        } else {
+            "Stop Recording"
+        }));
+    }
+
+    /// The controls popover: a row per V4L2 control of the open camera,
+    /// and Reset.
+    fn fill_controls(self: &Rc<Self>) {
+        let content = &self.ui.controls_box;
+        while let Some(child) = content.first_child() {
+            content.remove(&child);
+        }
+        let device = self.device_path.borrow().clone();
+        let controls = device.as_deref().map(controls::list).unwrap_or_default();
+        if controls.is_empty() {
+            let label = gtk::Label::builder()
+                .label("This camera has no adjustable controls.")
+                .wrap(true)
+                .max_width_chars(32)
+                .build();
+            label.add_css_class("dim-label");
+            content.append(&label);
+            return;
+        }
+        let Some(device) = device else {
+            return;
+        };
+        let apply = {
+            let device = device.clone();
+            let this = self.clone();
+            move |id: u32, value: i64| {
+                if let Err(error) = controls::set(&device, id, value) {
+                    this.ui
+                        .toasts
+                        .add_toast(adw::Toast::new(&format!("Control not set: {error}")));
+                }
+            }
+        };
+        let apply = Rc::new(apply);
+        for control in &controls {
+            let row = gtk::Box::builder().spacing(10).build();
+            let label = gtk::Label::builder()
+                .label(&control.name)
+                .xalign(0.0)
+                .width_chars(18)
+                .max_width_chars(18)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .tooltip_text(&control.name)
+                .build();
+            row.append(&label);
+            let id = control.id;
+            let widget: gtk::Widget = match &control.kind {
+                controls::Kind::Integer { min, max, step, .. } => {
+                    let scale = gtk::Scale::with_range(
+                        gtk::Orientation::Horizontal,
+                        *min as f64,
+                        *max as f64,
+                        *step as f64,
+                    );
+                    scale.set_value(control.value as f64);
+                    scale.set_hexpand(true);
+                    scale.set_draw_value(true);
+                    scale.set_value_pos(gtk::PositionType::Right);
+                    scale.set_digits(0);
+                    scale.set_width_request(180);
+                    let apply = apply.clone();
+                    scale.connect_value_changed(move |s| apply(id, s.value().round() as i64));
+                    scale.upcast()
+                }
+                controls::Kind::Boolean { .. } => {
+                    let switch = gtk::Switch::builder()
+                        .active(control.value != 0)
+                        .halign(gtk::Align::End)
+                        .hexpand(true)
+                        .valign(gtk::Align::Center)
+                        .build();
+                    let apply = apply.clone();
+                    switch.connect_state_set(move |_, on| {
+                        apply(id, i64::from(on));
+                        glib::Propagation::Proceed
+                    });
+                    switch.upcast()
+                }
+                controls::Kind::Menu { items, .. } => {
+                    let names: Vec<&str> = items.iter().map(|(_, n)| n.as_str()).collect();
+                    let dropdown = gtk::DropDown::from_strings(&names);
+                    if let Some(i) = items.iter().position(|(v, _)| *v == control.value) {
+                        dropdown.set_selected(i as u32);
+                    }
+                    dropdown.set_hexpand(true);
+                    let values: Vec<i64> = items.iter().map(|(v, _)| *v).collect();
+                    let apply = apply.clone();
+                    dropdown.connect_selected_notify(move |d| {
+                        if let Some(v) = values.get(d.selected() as usize) {
+                            apply(id, *v);
+                        }
+                    });
+                    dropdown.upcast()
+                }
+            };
+            widget.set_sensitive(!control.inactive && !control.read_only);
+            row.append(&widget);
+            content.append(&row);
+        }
+        let reset = gtk::Button::builder()
+            .label("Reset to Defaults")
+            .halign(gtk::Align::End)
+            .margin_top(6)
+            .build();
+        reset.add_css_class("pill");
+        reset.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                for control in &controls {
+                    if !control.read_only {
+                        let _ = controls::set(&device, control.id, control.default_value());
+                    }
+                }
+                this.fill_controls();
+            }
+        ));
+        content.append(&reset);
+    }
+
+    fn current_camera_name(&self) -> Option<String> {
+        let index = self.ui.cameras_dropdown.selected() as usize;
+        self.cameras.borrow().get(index).map(|c| c.name.clone())
+    }
+
+    /// The Format submenu for this camera: Automatic plus each format it
+    /// offers, as radio items over win.format.
+    fn fill_formats_menu(&self, info: &CameraInfo, chosen: Option<&Format>) {
+        let menu = &self.ui.formats_menu;
+        menu.remove_all();
+        let item = gio::MenuItem::new(Some("Automatic"), None);
+        item.set_action_and_target_value(Some("win.format"), Some(&"auto".to_variant()));
+        menu.append_item(&item);
+        for format in &info.formats {
+            let item = gio::MenuItem::new(Some(&format.label()), None);
+            item.set_action_and_target_value(Some("win.format"), Some(&format.id().to_variant()));
+            menu.append_item(&item);
+        }
+        if let Some(action) = self.ui.window.lookup_action("format") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                let state = chosen.map_or("auto".to_string(), Format::id);
+                action.set_state(&state.to_variant());
+            }
         }
     }
 
@@ -1098,6 +1548,156 @@ impl Window {
         });
     }
 
+    /// Remember a capture: the thumbnail button shows it and the gallery
+    /// lists it.
+    fn add_capture(&self, path: PathBuf, thumb: Option<camera::Frame>, video: bool) {
+        let paintable: gdk::Paintable = match thumb {
+            Some(frame) => {
+                let bytes = glib::Bytes::from(&frame.rgb);
+                gdk::MemoryTexture::new(
+                    frame.width as i32,
+                    frame.height as i32,
+                    gdk::MemoryFormat::R8g8b8,
+                    &bytes,
+                    frame.stride,
+                )
+                .upcast()
+            }
+            None => gtk::IconTheme::for_display(&WidgetExt::display(&self.ui.window))
+                .lookup_icon(
+                    if video {
+                        "video-x-generic-symbolic"
+                    } else {
+                        "image-x-generic-symbolic"
+                    },
+                    &[],
+                    64,
+                    1,
+                    gtk::TextDirection::None,
+                    gtk::IconLookupFlags::empty(),
+                )
+                .upcast(),
+        };
+        self.ui.thumb_picture.set_paintable(Some(&paintable));
+        self.ui.thumb_button.set_visible(true);
+        self.ui.thumb_button.set_tooltip_text(Some(if video {
+            "Last Video"
+        } else {
+            "Last Photo"
+        }));
+        let tile = gallery_tile(&paintable, &path, video);
+        self.ui.gallery.insert(&tile, 0);
+        let mut captures = self.captures.borrow_mut();
+        captures.insert(0, Capture { path, video });
+        while captures.len() > GALLERY_SIZE {
+            captures.pop();
+            if let Some(last) = self.ui.gallery.child_at_index(GALLERY_SIZE as i32) {
+                self.ui.gallery.remove(&last);
+            }
+        }
+    }
+
+    /// Put the newest photo on the clipboard as an image.
+    fn copy_last_photo(&self) {
+        let path = self
+            .captures
+            .borrow()
+            .iter()
+            .find(|c| !c.video)
+            .map(|c| c.path.clone());
+        let Some(path) = path else {
+            self.ui.toasts.add_toast(adw::Toast::new("No photo yet"));
+            return;
+        };
+        match gdk::Texture::from_filename(&path) {
+            Ok(texture) => {
+                self.ui.window.clipboard().set_texture(&texture);
+                self.ui.toasts.add_toast(adw::Toast::new("Photo copied"));
+            }
+            Err(error) => self
+                .ui
+                .toasts
+                .add_toast(adw::Toast::new(&format!("Could not copy: {error}"))),
+        }
+    }
+
+    /// A desktop notification for a capture made while Gaze is not the
+    /// focused window (the self-timer or a script took it).
+    fn notify_capture(&self, title: &str, path: &std::path::Path) {
+        if self.ui.window.is_active() {
+            return;
+        }
+        let Some(app) = self.ui.window.application() else {
+            return;
+        };
+        let notification = gio::Notification::new(title);
+        if let Some(name) = path.file_name() {
+            notification.set_body(Some(&name.to_string_lossy()));
+        }
+        notification.set_icon(&gio::FileIcon::new(&gio::File::for_path(path)));
+        notification.set_default_action_and_target_value(
+            "app.open-path",
+            Some(&path.to_string_lossy().to_variant()),
+        );
+        app.send_notification(Some("capture"), &notification);
+    }
+
+    /// Photos every quarter second while the shutter is held.
+    fn start_burst(self: &Rc<Self>) {
+        if self.burst.borrow().is_some() {
+            return;
+        }
+        self.burst_count.set(0);
+        self.burst_shot();
+        let source = glib::timeout_add_local(
+            Duration::from_millis(250),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    this.burst_shot();
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+        self.burst.replace(Some(source));
+        self.ui.timer.set_visible(true);
+    }
+
+    fn burst_shot(self: &Rc<Self>) {
+        let n = self.burst_count.get() + 1;
+        self.burst_count.set(n);
+        self.ui.timer.set_label(&format!("{n} photos"));
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            return;
+        };
+        let path = photos_dir().join(format!("Gaze {} {n:02}.jpg", timestamp()));
+        let photo = camera.take_photo(path);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok((path, thumb)) = photo.await {
+                this.add_capture(path, thumb, false);
+            }
+        });
+    }
+
+    fn stop_burst(&self) {
+        let Some(source) = self.burst.take() else {
+            return;
+        };
+        source.remove();
+        self.ui.timer.set_visible(false);
+        self.ui.timer.set_label("00:00");
+        let n = self.burst_count.get();
+        self.ui.toasts.add_toast(adw::Toast::new(&format!(
+            "{n} photo{} saved",
+            if n == 1 { "" } else { "s" }
+        )));
+    }
+
     fn set_effect(&self, effect: Option<&'static Effect>) {
         if let Some(camera) = self.camera.borrow().as_ref() {
             if let Err(error) = camera.set_effect(effect) {
@@ -1204,7 +1804,15 @@ impl Window {
                 }
                 self.recording_since.set(None);
                 self.update_shutter();
+                let thumb = self.recording_thumb.take();
+                self.add_capture(path.clone(), thumb, true);
+                self.notify_capture("Video saved", &path);
                 self.toast_file("Video saved", path);
+            }
+            Event::AudioLevel(level) => {
+                // Hold peaks a little so the meter is readable.
+                let shown = self.ui.level.value();
+                self.ui.level.set_value(level.max(shown * 0.8));
             }
             Event::OutputFailed(text) => {
                 if let Some(camera) = self.camera.borrow().as_ref() {
@@ -1265,7 +1873,11 @@ impl Window {
                 let photo = camera.take_photo(path);
                 glib::spawn_future_local(async move {
                     match photo.await {
-                        Ok(path) => this.toast_file("Photo saved", path),
+                        Ok((path, thumb)) => {
+                            this.add_capture(path.clone(), thumb, false);
+                            this.notify_capture("Photo saved", &path);
+                            this.toast_file("Photo saved", path);
+                        }
                         Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&format!(
                             "Could not save the photo: {error}"
                         ))),
@@ -1287,8 +1899,19 @@ impl Window {
                             .add_toast(adw::Toast::new(&error.to_string()));
                         return;
                     }
-                    match camera.start_recording(&path) {
-                        Ok(()) => self.recording_since.set(Some(Instant::now())),
+                    let mic = self.settings.borrow().mic.clone();
+                    match camera.start_recording(&path, mic.as_deref()) {
+                        Ok(()) => {
+                            self.recording_since.set(Some(Instant::now()));
+                            self.paused_total.set(Duration::ZERO);
+                            self.paused_at.set(None);
+                            self.ui.pause_button.set_active(false);
+                            let snapshot = camera.snapshot();
+                            let this = self.clone();
+                            glib::spawn_future_local(async move {
+                                this.recording_thumb.replace(snapshot.await);
+                            });
+                        }
                         Err(error) => self.ui.toasts.add_toast(adw::Toast::new(&error)),
                     }
                 }
@@ -1326,6 +1949,12 @@ impl Window {
             shutter.set_tooltip_text(Some("Cancel Timer"));
         }
         self.ui.timer.set_visible(recording);
+        self.ui.pause_button.set_visible(recording);
+        self.ui.level.set_visible(recording);
+        if !recording {
+            self.ui.level.set_value(0.0);
+            self.ui.pause_button.set_active(false);
+        }
         self.ui.mode_toggle.set_sensitive(!recording && !counting);
         self.ui
             .cameras_dropdown
@@ -1348,7 +1977,12 @@ impl Window {
 
     fn tick(&self) {
         if let Some(since) = self.recording_since.get() {
-            let s = since.elapsed().as_secs();
+            let paused = self.paused_total.get()
+                + self
+                    .paused_at
+                    .get()
+                    .map_or(Duration::ZERO, |at| at.elapsed());
+            let s = since.elapsed().saturating_sub(paused).as_secs();
             self.ui
                 .timer
                 .set_label(&format!("{:02}:{:02}", s / 60, s % 60));
@@ -1437,10 +2071,7 @@ impl Window {
             .button_label("Open")
             .timeout(4)
             .build();
-        toast.connect_button_clicked(move |_| {
-            let uri = gio::File::for_path(&path).uri();
-            let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
-        });
+        toast.connect_button_clicked(move |_| open_file(&path));
         self.ui.toasts.add_toast(toast);
     }
 }
@@ -1448,6 +2079,14 @@ impl Window {
 fn build_ui(app: &adw::Application) -> Ui {
     let cameras_dropdown = gtk::DropDown::builder().tooltip_text("Camera").build();
     let menu = gio::Menu::new();
+    let formats_menu = gio::Menu::new();
+    let picture_menu = gio::Menu::new();
+    picture_menu.append_submenu(Some("Format"), &formats_menu);
+    let mics_menu = gio::Menu::new();
+    picture_menu.append_submenu(Some("Microphone"), &mics_menu);
+    picture_menu.append(Some("Grid"), Some("win.grid"));
+    picture_menu.append(Some("Fullscreen"), Some("win.fullscreen"));
+    menu.append_section(None, &picture_menu);
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
     view.append(Some("Scan Codes"), Some("win.scan"));
@@ -1719,6 +2358,25 @@ fn build_ui(app: &adw::Application) -> Ui {
     left.append(&mode_toggle);
     left.append(&timer_button);
     left.append(&effects_button());
+    let controls_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(10)
+        .margin_end(10)
+        .width_request(380)
+        .build();
+    let controls_popover = gtk::Popover::builder().child(&controls_box).build();
+    let controls_button = gtk::MenuButton::builder()
+        .icon_name("emblem-system-symbolic")
+        .popover(&controls_popover)
+        .tooltip_text("Camera Controls")
+        .valign(gtk::Align::Center)
+        .build();
+    controls_button.add_css_class("osd");
+    controls_button.add_css_class("circular");
+    left.append(&controls_button);
     controls.set_start_widget(Some(&left));
     controls.set_center_widget(Some(&shutter));
     let scan_button = gtk::ToggleButton::builder()
@@ -1729,6 +2387,74 @@ fn build_ui(app: &adw::Application) -> Ui {
         .build();
     scan_button.add_css_class("osd");
     scan_button.add_css_class("circular");
+    // Last capture: a thumbnail that opens the session's gallery.
+    // A picture wants its texture's size; allocating it as an overlay over
+    // a fixed 44 px box, clipped, keeps the button small whatever it shows.
+    let thumb_picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Cover)
+        .build();
+    let thumb_frame = gtk::Overlay::builder()
+        .child(
+            &gtk::Box::builder()
+                .width_request(44)
+                .height_request(44)
+                .build(),
+        )
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    thumb_frame.add_css_class("thumb-frame");
+    thumb_frame.add_overlay(&thumb_picture);
+    thumb_frame.set_clip_overlay(&thumb_picture, true);
+    let gallery = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(4)
+        .min_children_per_line(2)
+        .column_spacing(4)
+        .row_spacing(4)
+        .homogeneous(true)
+        .activate_on_single_click(true)
+        .build();
+    gallery.add_css_class("gallery");
+    let gallery_scroller = gtk::ScrolledWindow::builder()
+        .child(&gallery)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(420)
+        .build();
+    let copy_last = gtk::Button::builder()
+        .label("Copy Photo")
+        .action_name("win.copy-last")
+        .build();
+    copy_last.add_css_class("pill");
+    let open_photos = gtk::Button::builder()
+        .label("Open Folder")
+        .action_name("win.open-photos")
+        .build();
+    open_photos.add_css_class("pill");
+    let gallery_buttons = gtk::Box::builder().spacing(8).build();
+    gallery_buttons.append(&copy_last);
+    gallery_buttons.append(&open_photos);
+    let gallery_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    gallery_box.append(&gallery_scroller);
+    gallery_box.append(&gallery_buttons);
+    let gallery_popover = gtk::Popover::builder().child(&gallery_box).build();
+    let thumb_button = gtk::MenuButton::builder()
+        .child(&thumb_frame)
+        .popover(&gallery_popover)
+        .tooltip_text("Last Photo")
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    thumb_button.add_css_class("osd");
+    thumb_button.add_css_class("thumb");
+
     let right = gtk::Box::builder()
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
@@ -1742,7 +2468,31 @@ fn build_ui(app: &adw::Application) -> Ui {
     read_text.add_css_class("osd");
     read_text.add_css_class("circular");
     read_text.set_action_name(Some("win.read-text"));
+    let pause_button = gtk::ToggleButton::builder()
+        .icon_name("media-playback-pause-symbolic")
+        .tooltip_text("Pause Recording")
+        .action_name("win.pause")
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    pause_button.add_css_class("osd");
+    pause_button.add_css_class("circular");
+    let level = gtk::LevelBar::builder()
+        .min_value(0.0)
+        .max_value(1.0)
+        .width_request(72)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .tooltip_text("Microphone level")
+        .build();
+    level.add_offset_value(gtk::LEVEL_BAR_OFFSET_LOW, 0.5);
+    level.add_offset_value(gtk::LEVEL_BAR_OFFSET_HIGH, 0.85);
+    level.add_offset_value(gtk::LEVEL_BAR_OFFSET_FULL, 0.97);
+    level.add_css_class("mic-level");
+    right.append(&level);
+    right.append(&pause_button);
     right.append(&timer);
+    right.append(&thumb_button);
     right.append(&read_text);
     right.append(&scan_button);
     controls.set_end_widget(Some(&right));
@@ -1805,7 +2555,60 @@ fn build_ui(app: &adw::Application) -> Ui {
         mode_toggle,
         timer,
         flash,
+        toolbar,
+        formats_menu,
+        mics_menu,
+        pause_button,
+        level,
+        thumb_button,
+        thumb_picture,
+        gallery,
+        controls_box,
+        controls_button,
     }
+}
+
+/// A gallery entry: the thumbnail, a play badge for videos.
+fn gallery_tile(paintable: &gdk::Paintable, path: &std::path::Path, video: bool) -> gtk::Widget {
+    let picture = gtk::Picture::builder()
+        .paintable(paintable)
+        .content_fit(gtk::ContentFit::Cover)
+        .width_request(128)
+        .height_request(72)
+        .build();
+    let frame = gtk::Box::builder().overflow(gtk::Overflow::Hidden).build();
+    frame.add_css_class("thumb-frame");
+    frame.append(&picture);
+    let overlay = gtk::Overlay::builder().child(&frame).build();
+    if video {
+        let badge = gtk::Image::builder()
+            .icon_name("media-playback-start-symbolic")
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .pixel_size(24)
+            .build();
+        badge.add_css_class("osd");
+        badge.add_css_class("circular");
+        overlay.add_overlay(&badge);
+    }
+    let button = gtk::Button::builder()
+        .child(&overlay)
+        .tooltip_text(
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        )
+        .build();
+    button.add_css_class("flat");
+    button.set_can_focus(false);
+    // The flow box child is what gets activated; the button is for looks.
+    button.set_can_target(false);
+    button.upcast()
+}
+
+fn open_file(path: &std::path::Path) {
+    let uri = gio::File::for_path(path).uri();
+    let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
 }
 
 fn special_dir(dir: glib::UserDirectory, fallback: &str) -> PathBuf {

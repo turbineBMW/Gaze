@@ -17,6 +17,14 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Format (menu): pick the camera's size and frame rate; remembered per
+  camera. Grid (Ctrl+G) and Fullscreen (F11).
+- Camera controls (Ctrl+Shift+K): whatever the driver exposes, as sliders,
+  switches and menus, with Reset to Defaults.
+- Gallery (Ctrl+Shift+G) behind the last-shot thumbnail; Copy Photo
+  (Ctrl+Shift+C). Hold the shutter for a burst.
+- Pause and resume a recording (Ctrl+P) without a gap in the file; pick the
+  microphone from the menu and watch its level while recording.
 - Virtual Camera (Ctrl+V): Gaze's picture, effects included, as a camera
   named "Gaze" that Meet, Zoom, Chromium and OBS can pick. Needs the
   v4l2loopback kernel module; the device is created the first time through

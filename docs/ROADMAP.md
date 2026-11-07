@@ -74,15 +74,20 @@ ordered by value for effort; each one leaves the app working and shippable.
 
 ## Phase 6: A complete camera app
 
-- Resolution and frame-rate picker from the camera's caps.
-- Camera controls where V4L2 exposes them: exposure, white balance,
-  brightness, contrast, zoom, focus; with reset.
-- Last-shot thumbnail that opens the file; a strip of this session's
-  captures.
-- Burst mode; pause and resume recording; microphone picker and live level
-  meter.
-- Rule-of-thirds grid, fullscreen, a compact always-on-top mirror mode.
-- Desktop notification with thumbnail on capture; copy to clipboard.
+- [x] Format submenu: the camera's raw sizes and frame rates, remembered
+      per camera; Automatic keeps the driver's pick up to 1080p.
+- [x] Camera controls where V4L2 exposes them (scales, switches, menus,
+      Reset to Defaults), read and set with the standard ioctls.
+- [x] Last-shot thumbnail opening a gallery of this session's captures;
+      Copy Photo puts the newest on the clipboard.
+- [x] Burst while the shutter is held; pause and resume recording with a
+      continuous file; Microphone submenu and a live level meter.
+- [x] Rule-of-thirds grid, fullscreen (F11), capture notifications when
+      Gaze is not focused, `app.quit` for scripts.
+- [ ] A compact always-on-top mirror mode (a Hyprland window rule does it
+      today: `windowrule = pin, class:io.github.turbinebmw.Gaze`).
+- [ ] Live thumbnails in the effects picker; a modprobe snippet for a
+      permanent virtual camera device.
 
 ## Phase 7: Stretch
 

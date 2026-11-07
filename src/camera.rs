@@ -35,6 +35,133 @@ use std::sync::{Arc, Mutex};
 pub struct CameraInfo {
     pub name: String,
     source: Source,
+    /// The raw formats the camera offers, largest and fastest first.
+    pub formats: Vec<Format>,
+}
+
+impl CameraInfo {
+    /// The V4L2 node, for controls; `None` for other kinds of source.
+    pub fn device_path(&self) -> Option<PathBuf> {
+        match &self.source {
+            Source::V4l2(path) => Some(PathBuf::from(path)),
+            Source::Device(_) => None,
+        }
+    }
+}
+
+/// A size and frame rate a camera can deliver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub width: i32,
+    pub height: i32,
+    pub fps: Option<gst::Fraction>,
+}
+
+impl Format {
+    /// A stable id for menus and the settings file: `1920x1080@30/1`.
+    pub fn id(&self) -> String {
+        match self.fps {
+            Some(fps) => format!(
+                "{}x{}@{}/{}",
+                self.width,
+                self.height,
+                fps.numer(),
+                fps.denom()
+            ),
+            None => format!("{}x{}", self.width, self.height),
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Format> {
+        let (size, fps) = match id.split_once('@') {
+            Some((size, fps)) => (size, Some(fps)),
+            None => (id, None),
+        };
+        let (w, h) = size.split_once('x')?;
+        let fps = match fps {
+            Some(fps) => {
+                let (n, d) = fps.split_once('/').unwrap_or((fps, "1"));
+                Some(gst::Fraction::new(n.parse().ok()?, d.parse().ok()?))
+            }
+            None => None,
+        };
+        Some(Format {
+            width: w.parse().ok()?,
+            height: h.parse().ok()?,
+            fps,
+        })
+    }
+
+    /// For people: `1920 × 1080 · 30 fps`.
+    pub fn label(&self) -> String {
+        let size = format!("{} × {}", self.width, self.height);
+        match self.fps {
+            Some(fps) if fps.denom() != 0 => {
+                let rate = fps.numer() as f64 / fps.denom() as f64;
+                if (rate - rate.round()).abs() < 0.01 {
+                    format!("{size} · {} fps", rate.round() as i64)
+                } else {
+                    format!("{size} · {rate:.2} fps")
+                }
+            }
+            _ => size,
+        }
+    }
+
+    fn pixels(&self) -> i64 {
+        self.width as i64 * self.height as i64
+    }
+
+    fn rate(&self) -> f64 {
+        self.fps
+            .filter(|f| f.denom() != 0)
+            .map_or(0.0, |f| f.numer() as f64 / f.denom() as f64)
+    }
+}
+
+/// The fixed raw formats in a device's caps, deduplicated, largest and
+/// fastest first. Frame-rate lists are expanded; ranges contribute their
+/// top.
+fn formats_from_caps(caps: &gst::Caps) -> Vec<Format> {
+    let mut formats: Vec<Format> = Vec::new();
+    for structure in caps.iter() {
+        if structure.name() != "video/x-raw" {
+            continue;
+        }
+        let (Ok(width), Ok(height)) = (
+            structure.get::<i32>("width"),
+            structure.get::<i32>("height"),
+        ) else {
+            continue;
+        };
+        let mut rates: Vec<Option<gst::Fraction>> = Vec::new();
+        if let Ok(fps) = structure.get::<gst::Fraction>("framerate") {
+            rates.push(Some(fps));
+        } else if let Ok(list) = structure.get::<gst::List>("framerate") {
+            rates.extend(
+                list.iter()
+                    .filter_map(|v| v.get::<gst::Fraction>().ok().map(Some)),
+            );
+        } else if let Ok(range) = structure.get::<gst::FractionRange>("framerate") {
+            rates.push(Some(range.max()));
+        } else {
+            rates.push(None);
+        }
+        for fps in rates {
+            let format = Format { width, height, fps };
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
+    formats.sort_by(|a, b| {
+        b.pixels().cmp(&a.pixels()).then(
+            b.rate()
+                .partial_cmp(&a.rate())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    formats
 }
 
 enum Source {
@@ -73,6 +200,10 @@ pub fn list() -> Vec<CameraInfo> {
         if name == crate::vcam::LABEL {
             continue;
         }
+        let formats = device
+            .caps()
+            .map(|c| formats_from_caps(&c))
+            .unwrap_or_default();
         match (api.as_str(), path) {
             ("v4l2", Some(path)) => {
                 if !seen.contains(&path) {
@@ -80,12 +211,14 @@ pub fn list() -> Vec<CameraInfo> {
                     v4l2.push(CameraInfo {
                         name,
                         source: Source::V4l2(path),
+                        formats,
                     });
                 }
             }
             _ => other.push(CameraInfo {
                 name,
                 source: Source::Device(device),
+                formats,
             }),
         }
     }
@@ -93,11 +226,50 @@ pub fn list() -> Vec<CameraInfo> {
     v4l2
 }
 
+/// A microphone, as PipeWire/PulseAudio names it.
+pub struct MicInfo {
+    pub name: String,
+    /// What `pulsesrc`'s `device` takes.
+    pub device: String,
+}
+
+/// The microphones the device monitor reports.
+pub fn mics() -> Vec<MicInfo> {
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Audio/Source"), None);
+    if let Err(error) = monitor.start() {
+        log::warn!("device monitor (audio): {error}");
+        return Vec::new();
+    }
+    let devices = monitor.devices();
+    monitor.stop();
+    let mut mics = Vec::new();
+    for device in devices {
+        let Some(props) = device.properties() else {
+            continue;
+        };
+        let Ok(node) = props.get::<String>("node.name") else {
+            continue;
+        };
+        // Monitors of outputs are not microphones.
+        if node.ends_with(".monitor") || mics.iter().any(|m: &MicInfo| m.device == node) {
+            continue;
+        }
+        mics.push(MicInfo {
+            name: device.display_name().to_string(),
+            device: node,
+        });
+    }
+    mics
+}
+
 /// What the bus watch tells the window.
 pub enum Event {
     Error(String),
     RecordingSaved(PathBuf),
     RecordingFailed(String),
+    /// The microphone's level while recording, 0 to 1.
+    AudioLevel(f64),
     /// The virtual camera branch failed and was removed.
     OutputFailed(String),
 }
@@ -217,6 +389,8 @@ pub struct Camera {
     taps: Arc<Mutex<Taps>>,
     recording: std::cell::RefCell<Option<Recording>>,
     output: std::cell::RefCell<Option<Recording>>,
+    /// Pause bookkeeping shared with the recorder's pad probes.
+    pauses: Arc<Mutex<Pauses>>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -224,6 +398,30 @@ pub struct Camera {
 struct Recording {
     bin: gst::Bin,
     tee_pad: gst::Pad,
+}
+
+/// Where a recording is paused, in pipeline running time (what buffers
+/// are stamped with). Buffers stamped after `pause_at` are dropped; once
+/// resumed, buffers from before `resume_at` are dropped too and later ones
+/// are shifted back by everything paused so far.
+#[derive(Default)]
+struct Pauses {
+    pause_at: Option<gst::ClockTime>,
+    resume_at: gst::ClockTime,
+    shift: u64,
+}
+
+impl Pauses {
+    /// What to do with a buffer stamped `pts`: `None` drops it, otherwise
+    /// the stamp to give it.
+    fn apply(&self, pts: gst::ClockTime) -> Option<gst::ClockTime> {
+        if self.pause_at.is_some_and(|p| pts >= p) || pts < self.resume_at {
+            return None;
+        }
+        Some(gst::ClockTime::from_nseconds(
+            pts.nseconds().saturating_sub(self.shift),
+        ))
+    }
 }
 
 fn make(factory: &str) -> Result<gst::Element, String> {
@@ -235,7 +433,11 @@ fn make(factory: &str) -> Result<gst::Element, String> {
 impl Camera {
     /// Build the pipeline for `info` and start it. `on_event` runs on the
     /// main loop.
-    pub fn open(info: &CameraInfo, on_event: impl Fn(Event) + 'static) -> Result<Self, String> {
+    pub fn open(
+        info: &CameraInfo,
+        format: Option<&Format>,
+        on_event: impl Fn(Event) + 'static,
+    ) -> Result<Self, String> {
         let pipeline = gst::Pipeline::with_name("gaze");
         let source = match &info.source {
             Source::V4l2(path) => {
@@ -247,10 +449,23 @@ impl Camera {
                 .create_element(Some("source"))
                 .map_err(|e| format!("cannot open {}: {e}", info.name))?,
         };
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("width", gst::IntRange::new(1, 1920))
-            .field("height", gst::IntRange::new(1, 1080))
-            .build();
+        // A chosen format exactly; otherwise anything up to 1080p and the
+        // driver's pick.
+        let caps = match format {
+            Some(f) => {
+                let mut caps = gst::Caps::builder("video/x-raw")
+                    .field("width", f.width)
+                    .field("height", f.height);
+                if let Some(fps) = f.fps {
+                    caps = caps.field("framerate", fps);
+                }
+                caps.build()
+            }
+            None => gst::Caps::builder("video/x-raw")
+                .field("width", gst::IntRange::new(1, 1920))
+                .field("height", gst::IntRange::new(1, 1080))
+                .build(),
+        };
         let filter = make("capsfilter")?;
         filter.set_property("caps", &caps);
         let effect = make("identity")?;
@@ -366,6 +581,11 @@ impl Camera {
                         let Some(s) = element.structure() else {
                             return glib::ControlFlow::Continue;
                         };
+                        if s.name() == "level" {
+                            if let Some(db) = level_db(s) {
+                                on_event(Event::AudioLevel(((db + 60.0) / 60.0).clamp(0.0, 1.0)));
+                            }
+                        }
                         if s.name() == "GstBinForwarded" {
                             if let Ok(inner) = s.get::<gst::Message>("message") {
                                 if let MessageView::Eos(_) = inner.view() {
@@ -404,6 +624,7 @@ impl Camera {
             taps,
             recording: std::cell::RefCell::new(None),
             output: std::cell::RefCell::new(None),
+            pauses: Arc::default(),
             _bus_watch: bus_watch,
         })
     }
@@ -503,18 +724,34 @@ impl Camera {
         }
     }
 
-    /// Save the frame on screen as a JPEG. Runs the conversion and encoding
-    /// off the main loop.
+    /// Save the frame on screen as a JPEG, and make a small RGB copy of it
+    /// for the gallery. Runs the conversion and encoding off the main loop.
     pub fn take_photo(
         &self,
         path: PathBuf,
-    ) -> impl std::future::Future<Output = Result<PathBuf, String>> + 'static {
+    ) -> impl std::future::Future<Output = Result<(PathBuf, Option<Frame>), String>> + 'static {
         let sample = self.preview.property::<Option<gst::Sample>>("last-sample");
         async move {
             let sample = sample.ok_or("no frame yet")?;
-            gio::spawn_blocking(move || save_jpeg(&sample, &path).map(|_| path))
+            gio::spawn_blocking(move || {
+                save_jpeg(&sample, &path)?;
+                Ok((path, thumbnail(&sample, THUMBNAIL_WIDTH)))
+            })
+            .await
+            .map_err(|_| "photo thread failed".to_string())?
+        }
+    }
+
+    /// A small RGB copy of the frame on screen (for a recording's gallery
+    /// entry).
+    pub fn snapshot(&self) -> impl std::future::Future<Output = Option<Frame>> + 'static {
+        let sample = self.preview.property::<Option<gst::Sample>>("last-sample");
+        async move {
+            let sample = sample?;
+            gio::spawn_blocking(move || thumbnail(&sample, THUMBNAIL_WIDTH))
                 .await
-                .map_err(|_| "photo thread failed".to_string())?
+                .ok()
+                .flatten()
         }
     }
 
@@ -522,9 +759,9 @@ impl Camera {
         self.recording.borrow().is_some()
     }
 
-    /// Start recording the camera and the default microphone to `path`
-    /// (H.264 on the GPU through VA-API, AAC, MP4).
-    pub fn start_recording(&self, path: &Path) -> Result<(), String> {
+    /// Start recording the camera and a microphone (`None`: the default) to
+    /// `path` (H.264 on the GPU through VA-API, AAC, MP4).
+    pub fn start_recording(&self, path: &Path, mic: Option<&str>) -> Result<(), String> {
         if self.is_recording() {
             return Ok(());
         }
@@ -532,7 +769,8 @@ impl Camera {
             "queue name=vq max-size-buffers=0 max-size-bytes=0 max-size-time=2000000000 \
                ! videoconvert ! vah264enc bitrate=8000 ! h264parse \
                ! mp4mux name=mux ! filesink name=out location=\"{}\" \
-             pulsesrc name=mic ! queue max-size-time=2000000000 ! audioconvert ! audioresample \
+             pulsesrc name=mic ! queue name=aq max-size-time=2000000000 ! audioconvert \
+               ! level interval=100000000 ! audioresample \
                ! audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=160000 ! aacparse ! mux.",
             path.display().to_string().replace('"', "\\\"")
         );
@@ -540,14 +778,55 @@ impl Camera {
             .map_err(|e| format!("cannot build the recorder: {e}"))?;
         bin.set_property("message-forward", true);
         bin.set_property("name", "recording");
+        if let (Some(mic), Some(device)) = (bin.by_name("mic"), mic) {
+            mic.set_property("device", device);
+        }
+
+        // Pausing: the queues' probes drop or restamp buffers. Pad offsets
+        // move the segment, not the stamps, so buffers carry pipeline
+        // running time and Pauses works in that.
+        *self.pauses.lock().unwrap_or_else(|e| e.into_inner()) = Pauses::default();
+        for queue in ["vq", "aq"] {
+            let Some(pad) = bin.by_name(queue).and_then(|q| q.static_pad("sink")) else {
+                continue;
+            };
+            let pauses = self.pauses.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(pts) = buffer.pts() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let decision = pauses.lock().unwrap_or_else(|e| e.into_inner()).apply(pts);
+                match decision {
+                    None => gst::PadProbeReturn::Drop,
+                    Some(stamped) => {
+                        if stamped != pts {
+                            let b = buffer.make_mut();
+                            b.set_pts(stamped);
+                            b.set_dts(None);
+                        }
+                        gst::PadProbeReturn::Ok
+                    }
+                }
+            });
+        }
 
         // Both branches reach the muxer in pipeline running time; start the
-        // file at zero.
-        let now = self
-            .pipeline
-            .current_running_time()
+        // file at zero. The anchor is the frame on screen, not the clock:
+        // the next frame to arrive is stamped a little before "now" (capture
+        // time plus the pipeline's latency), and a frame stamped before the
+        // segment start is clipped by the encoder, taking the opening
+        // keyframe with it.
+        let shown = self
+            .preview
+            .property::<Option<gst::Sample>>("last-sample")
+            .and_then(|s| s.buffer().and_then(|b| b.pts()));
+        let start = shown
+            .or_else(|| self.pipeline.current_running_time())
             .unwrap_or(gst::ClockTime::ZERO);
-        let offset = -(now.nseconds() as i64);
+        let offset = -(start.nseconds() as i64);
         let sink_pad = bin.static_pad("sink").ok_or("recorder has no input")?;
         sink_pad.set_offset(offset);
         if let Some(mic) = bin.by_name("mic").and_then(|m| m.static_pad("src")) {
@@ -567,10 +846,49 @@ impl Camera {
         Ok(())
     }
 
+    fn running_time(&self) -> Option<gst::ClockTime> {
+        if !self.is_recording() {
+            return None;
+        }
+        self.pipeline.current_running_time()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pause_at
+            .is_some()
+    }
+
+    /// Stop writing frames and sound until [`Camera::resume_recording`];
+    /// the file carries on as if the pause never happened.
+    pub fn pause_recording(&self) {
+        let Some(now) = self.running_time() else {
+            return;
+        };
+        let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+        if pauses.pause_at.is_none() {
+            pauses.pause_at = Some(now);
+        }
+    }
+
+    pub fn resume_recording(&self) {
+        let Some(now) = self.running_time() else {
+            return;
+        };
+        let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(paused_at) = pauses.pause_at.take() {
+            pauses.shift += now.nseconds().saturating_sub(paused_at.nseconds());
+            pauses.resume_at = now;
+        }
+    }
+
     /// End the recording: detach it from the camera and send end-of-stream
     /// through both branches. The file is complete when the bus reports
     /// [`Event::RecordingSaved`].
     pub fn stop_recording(&self) {
+        self.resume_recording();
         let recording = self.recording.borrow();
         let Some(rec) = recording.as_ref() else {
             return;
@@ -618,6 +936,18 @@ impl Drop for Camera {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// The loudest channel's RMS from a `level` message, in dB.
+fn level_db(s: &gst::StructureRef) -> Option<f64> {
+    let values: Vec<f64> = if let Ok(array) = s.get::<glib::ValueArray>("rms") {
+        array.iter().filter_map(|v| v.get::<f64>().ok()).collect()
+    } else if let Ok(list) = s.get::<gst::List>("rms") {
+        list.iter().filter_map(|v| v.get::<f64>().ok()).collect()
+    } else {
+        return None;
+    };
+    values.into_iter().reduce(f64::max)
 }
 
 fn in_bin(element: &gst::Element, name: &str) -> bool {
@@ -744,6 +1074,29 @@ fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
     })
 }
 
+pub const THUMBNAIL_WIDTH: i32 = 320;
+
+/// The sample scaled to `width` pixels wide, packed RGB.
+fn thumbnail(sample: &gst::Sample, width: i32) -> Option<Frame> {
+    let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
+    if info.width() == 0 {
+        return None;
+    }
+    let height = ((width as i64 * info.height() as i64 / info.width() as i64) & !1).max(2);
+    let small = gst_video::convert_sample(
+        sample,
+        &gst::Caps::builder("video/x-raw")
+            .field("format", "RGB")
+            .field("width", width)
+            .field("height", height as i32)
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build(),
+        Some(gst::ClockTime::from_seconds(5)),
+    )
+    .ok()?;
+    frame_from_sample(&small)
+}
+
 fn save_jpeg(sample: &gst::Sample, path: &Path) -> Result<(), String> {
     let rgb = gst_video::convert_sample(
         sample,
@@ -773,4 +1126,68 @@ fn save_jpeg(sample: &gst::Sample, path: &Path) -> Result<(), String> {
     pixbuf
         .savev(path, "jpeg", &[("quality", "95")])
         .map_err(|e| format!("cannot save {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn format_ids_round_trip() {
+        let f = Format {
+            width: 1280,
+            height: 720,
+            fps: Some(gst::Fraction::new(30000, 1001)),
+        };
+        assert_eq!(f.id(), "1280x720@30000/1001");
+        assert_eq!(Format::parse(&f.id()), Some(f.clone()));
+        assert_eq!(f.label(), "1280 × 720 · 29.97 fps");
+        let plain = Format::parse("640x480").unwrap();
+        assert_eq!(plain.fps, None);
+        assert_eq!(plain.label(), "640 × 480");
+        assert_eq!(Format::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn pauses_drop_and_shift() {
+        let t = gst::ClockTime::from_mseconds;
+        let mut p = Pauses::default();
+        assert_eq!(p.apply(t(500)), Some(t(500)));
+        // Paused at 1 s: later stamps are dropped, earlier late ones pass.
+        p.pause_at = Some(t(1000));
+        assert_eq!(p.apply(t(990)), Some(t(990)));
+        assert_eq!(p.apply(t(1000)), None);
+        assert_eq!(p.apply(t(2500)), None);
+        // Resumed at 3 s: 2 s vanish; a straggler from the pause is dropped.
+        p.pause_at = None;
+        p.shift = 2000 * 1_000_000;
+        p.resume_at = t(3000);
+        assert_eq!(p.apply(t(2900)), None);
+        assert_eq!(p.apply(t(3000)), Some(t(1000)));
+        assert_eq!(p.apply(t(3033)), Some(t(1033)));
+    }
+
+    #[test]
+    fn formats_from_caps_expand_and_sort() {
+        gst::init().unwrap();
+        let caps = gst::Caps::from_str(
+            "video/x-raw, width=640, height=480, framerate={ 15/1, 30/1 }; \
+             video/x-raw, width=1920, height=1080, framerate=30/1; \
+             video/x-raw, width=1920, height=1080, framerate=30/1; \
+             image/jpeg, width=3840, height=2160, framerate=30/1; \
+             video/x-raw, width=1280, height=720, framerate=[ 1/1, 60/1 ]",
+        )
+        .unwrap();
+        let labels: Vec<String> = formats_from_caps(&caps).iter().map(Format::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "1920 × 1080 · 30 fps",
+                "1280 × 720 · 60 fps",
+                "640 × 480 · 30 fps",
+                "640 × 480 · 15 fps",
+            ]
+        );
+    }
 }

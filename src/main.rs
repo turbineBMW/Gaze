@@ -3,6 +3,7 @@
 
 mod camera;
 mod codes;
+mod controls;
 mod omarchy;
 mod settings;
 mod stats;
@@ -35,6 +36,12 @@ label.countdown {
 }
 menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
 popover.effects button { min-width: 92px; }
+levelbar.mic-level trough { min-height: 8px; background-color: rgb(0 0 0 / 45%); border: none; }
+levelbar.mic-level block { min-height: 8px; }
+button.thumb { padding: 3px; border-radius: 12px; min-width: 0; min-height: 0; }
+.thumb-frame { border-radius: 9px; }
+.gallery button { padding: 2px; border-radius: 10px; }
+.gallery .thumb-frame { border-radius: 8px; }
 button.text-chip {
   min-height: 0; padding: 0 6px; border-radius: 6px;
   background-color: rgb(0 0 0 / 55%); color: white;
@@ -86,6 +93,33 @@ fn main() -> glib::ExitCode {
     glib::set_application_name("Gaze");
     let app = adw::Application::builder().application_id(APP_ID).build();
     let state: Rc<RefCell<AppState>> = Rc::default();
+    // app.quit closes the window the proper way (the camera is released
+    // first), for scripts and the D-Bus action interface.
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    quit.connect_activate(glib::clone!(
+        #[weak]
+        app,
+        move |_, _| {
+            if let Some(window) = app.active_window() {
+                window.close();
+            } else {
+                app.quit();
+            }
+        }
+    ));
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
+    // app.open-path opens a file with its default app: what a capture
+    // notification does when clicked.
+    let open_path = gtk::gio::SimpleAction::new("open-path", Some(glib::VariantTy::STRING));
+    open_path.connect_activate(|_, value| {
+        if let Some(path) = value.and_then(|v| v.str()) {
+            let uri = gtk::gio::File::for_path(path).uri();
+            let _ =
+                gtk::gio::AppInfo::launch_default_for_uri(&uri, gtk::gio::AppLaunchContext::NONE);
+        }
+    });
+    app.add_action(&open_path);
     app.connect_activate(move |app| {
         if let Some(window) = app.active_window() {
             window.present();
