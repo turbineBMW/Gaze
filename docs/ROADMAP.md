@@ -59,11 +59,18 @@ ordered by value for effort; each one leaves the app working and shippable.
 
 ## Phase 5: Virtual camera
 
-- "Output to virtual camera": a `v4l2sink` branch on the tee feeding a
-  v4l2loopback device, so Meet, Zoom and Chromium get Gaze's mirrored,
-  colour-correct, filtered picture.
-- Create and own the loopback device through the elevation dialog, or use
-  one that already exists.
+- [x] "Virtual Camera" (Ctrl+V): a `queue ! videoconvert ! v4l2sink` branch
+      on the tee feeds a v4l2loopback device named "Gaze" (YUY2, no sync),
+      so Meet, Zoom, Chromium and OBS get Gaze's colour-correct, filtered
+      picture. Remembered, and restarted when the camera changes.
+- [x] The device is created on demand: Gaze re-runs itself as root through
+      `pkexec` (`gaze --add-virtual-camera`) and asks the module for a new
+      device over `/dev/v4l2loopback`, exclusive-caps so it is only a camera
+      while fed. It lasts until reboot and is found again by name.
+- [ ] The output is not mirrored (video-call apps mirror their own
+      self-view); an option for the rare app that does not.
+- [ ] A modprobe snippet from `install.sh` so the device exists at boot
+      without a prompt.
 
 ## Phase 6: A complete camera app
 

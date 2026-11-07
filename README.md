@@ -17,6 +17,10 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Virtual Camera (Ctrl+V): Gaze's picture, effects included, as a camera
+  named "Gaze" that Meet, Zoom, Chromium and OBS can pick. Needs the
+  v4l2loopback kernel module; the device is created the first time through
+  a polkit prompt and lasts until reboot.
 - Effects, the Photo Booth kind: Mirror, Squeeze, Stretch, Light Tunnel, Fish
   Eye, Twirl, Bulge, Square, Sepia, X-Pro, Thermal, X-Ray, Glow, Blur, Edges,
   Red Only. They are rendered on the GPU and go into photos and recordings

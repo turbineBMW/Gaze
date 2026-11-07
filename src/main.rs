@@ -8,6 +8,7 @@ mod settings;
 mod stats;
 mod text;
 mod theme;
+mod vcam;
 mod window;
 
 use adw::prelude::*;
@@ -63,6 +64,20 @@ button.shutter.recording > .inner {
 ";
 
 fn main() -> glib::ExitCode {
+    // `gaze --add-virtual-camera` is what Gaze runs as root (through pkexec)
+    // to make the loopback device; it prints the device and exits.
+    if std::env::args().nth(1).as_deref() == Some(vcam::ADD_FLAG) {
+        return match vcam::add_as_root() {
+            Ok(path) => {
+                println!("{}", path.display());
+                glib::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
     env_logger::Builder::from_env(env_logger::Env::new().filter_or("GAZE_LOG", "warn")).init();
     if let Err(error) = gst::init() {
         eprintln!("GStreamer: {error}");
