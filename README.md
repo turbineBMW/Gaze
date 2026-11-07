@@ -17,6 +17,9 @@ range, which makes everything look grey and flat; Gaze does not.
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
   encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+- Scan Codes (Ctrl+S): QR codes and barcodes are outlined as they are seen,
+  and a card offers what fits the payload: open a link, join a Wi-Fi
+  network, save a contact or event, copy the text.
 - Self-timer (3, 5 or 10 s; Ctrl+T cycles it) for photos and recordings, with
   a countdown on the picture. Escape or the shutter cancels.
 - Colour statistics (Ctrl+I): black and white level, mean level, saturation,

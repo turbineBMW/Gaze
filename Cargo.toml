@@ -13,6 +13,8 @@ gst-video = { package = "gstreamer-video", version = "0.25" }
 gst-app = { package = "gstreamer-app", version = "0.25" }
 log = "0.4"
 env_logger = "0.11"
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "multi_barcode_readers", "qrcode", "datamatrix", "oned", "aztec", "pdf417", "encoding_rs"] }
+async-channel = "2.5.0"
 
 [dev-dependencies]
 tempfile = "3"
