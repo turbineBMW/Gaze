@@ -1,7 +1,7 @@
 //! Cameras and the GStreamer pipeline behind the viewfinder.
 //!
 //! ```text
-//! source ! capsfilter (raw, system memory, <= 1080p) ! effect ! tee
+//! source ! capsfilter (raw, system memory, <= 1080p) ! effect ! background ! tee
 //!   tee. ! queue (leaky) ! gtk4paintablesink                 viewfinder + photos
 //!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! capsfilter ! appsink (RGB)
 //!                                                              analysis taps
@@ -17,7 +17,9 @@
 //!
 //! `effect` is an `identity`, or a GL bin (`glupload ! gleffects !
 //! gldownload`) swapped in under a blocking pad probe, so photos, recordings
-//! and taps all see the effect.
+//! and taps all see the effect. `background` is another identity, or a bin
+//! that bridges frames through the matting threads (appsink -> blur and
+//! composite -> appsrc) for background blur.
 //!
 //! V4L2 cameras are opened directly with `v4l2src`, the way Chromium opens
 //! them; anything else (libcamera) through the PipeWire device's own element.
@@ -379,9 +381,10 @@ pub struct Camera {
     pipeline: gst::Pipeline,
     paintable: gdk::Paintable,
     preview: gst::Element,
-    filter: gst::Element,
     /// What sits between the capsfilter and the tee, and which effect it is.
     effect: std::cell::RefCell<(gst::Element, Option<&'static str>)>,
+    /// The background slot after it, and whether blur is on.
+    background: std::cell::RefCell<(gst::Element, bool)>,
     tee: gst::Element,
     tap_valve: gst::Element,
     tap_rate: gst::Element,
@@ -486,6 +489,7 @@ impl Camera {
         let filter = make("capsfilter")?;
         filter.set_property("caps", &caps);
         let effect = make("identity")?;
+        let background = make("identity")?;
         let tee = make("tee")?;
 
         let preview_queue = make("queue")?;
@@ -544,6 +548,7 @@ impl Camera {
             &source,
             &filter,
             &effect,
+            &background,
             &tee,
             &preview_queue,
             &preview,
@@ -556,7 +561,8 @@ impl Camera {
             tap_sink.upcast_ref(),
         ];
         pipeline.add_many(elements).map_err(|e| e.to_string())?;
-        gst::Element::link_many([&source, &filter, &effect, &tee]).map_err(|e| e.to_string())?;
+        gst::Element::link_many([&source, &filter, &effect, &background, &tee])
+            .map_err(|e| e.to_string())?;
         gst::Element::link_many([&tee, &preview_queue, &preview]).map_err(|e| e.to_string())?;
         gst::Element::link_many([
             &tee,
@@ -632,8 +638,8 @@ impl Camera {
             pipeline,
             paintable,
             preview,
-            filter,
             effect: std::cell::RefCell::new((effect, None)),
+            background: std::cell::RefCell::new((background, false)),
             tee,
             tap_valve,
             tap_rate,
@@ -677,30 +683,65 @@ impl Camera {
             }
         };
         let (old, _) = self.effect.replace((new.clone(), wanted));
+        self.swap_slot(old, new)
+    }
+
+    /// Replace `old` (an element between two others) with `new`, on the
+    /// streaming thread with the flow blocked, so no frame is lost.
+    fn swap_slot(&self, old: gst::Element, new: gst::Element) -> Result<(), String> {
+        let upstream_pad = old
+            .static_pad("sink")
+            .and_then(|p| p.peer())
+            .ok_or("slot has no upstream")?;
         let pipeline = self.pipeline.clone();
-        let filter = self.filter.clone();
-        let tee = self.tee.clone();
-        let src_pad = self
-            .filter
-            .static_pad("src")
-            .ok_or("capsfilter has no src pad")?;
-        src_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_, _| {
-            filter.unlink(&old);
-            old.unlink(&tee);
-            let _ = old.set_state(gst::State::Null);
-            let _ = pipeline.remove(&old);
-            if let Err(error) = pipeline
-                .add(&new)
-                .map_err(|e| e.to_string())
-                .and_then(|_| filter.link(&new).map_err(|e| e.to_string()))
-                .and_then(|_| new.link(&tee).map_err(|e| e.to_string()))
-                .and_then(|_| new.sync_state_with_parent().map_err(|e| e.to_string()))
-            {
-                log::warn!("effect swap: {error}");
-            }
-            gst::PadProbeReturn::Remove
-        });
+        upstream_pad
+            .clone()
+            .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_, _| {
+                let Some(upstream) = upstream_pad.parent_element() else {
+                    return gst::PadProbeReturn::Remove;
+                };
+                let Some(downstream) = old
+                    .static_pad("src")
+                    .and_then(|p| p.peer())
+                    .and_then(|p| p.parent_element())
+                else {
+                    return gst::PadProbeReturn::Remove;
+                };
+                upstream.unlink(&old);
+                old.unlink(&downstream);
+                let _ = old.set_state(gst::State::Null);
+                let _ = pipeline.remove(&old);
+                if let Err(error) = pipeline
+                    .add(&new)
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| upstream.link(&new).map_err(|e| e.to_string()))
+                    .and_then(|_| new.link(&downstream).map_err(|e| e.to_string()))
+                    .and_then(|_| new.sync_state_with_parent().map_err(|e| e.to_string()))
+                {
+                    log::warn!("slot swap: {error}");
+                }
+                gst::PadProbeReturn::Remove
+            });
         Ok(())
+    }
+
+    pub fn background_blur(&self) -> bool {
+        self.background.borrow().1
+    }
+
+    /// Blur the background behind the person (the matting model must be
+    /// in the cache), or stop doing so.
+    pub fn set_background_blur(&self, on: bool) -> Result<(), String> {
+        if self.background.borrow().1 == on {
+            return Ok(());
+        }
+        let new: gst::Element = if on {
+            background_bin()?.upcast()
+        } else {
+            make("identity")?
+        };
+        let (old, _) = self.background.replace((new.clone(), on));
+        self.swap_slot(old, new)
     }
 
     /// Start handing frames to `handler` (on the streaming thread). The
@@ -1079,6 +1120,112 @@ impl Camera {
         let _ = rec.bin.set_state(gst::State::Null);
         let _ = self.pipeline.remove(&rec.bin);
     }
+}
+
+/// The background blur slot: frames leave the pipeline through an appsink
+/// into the matting threads and come back through an appsrc, composited.
+fn background_bin() -> Result<gst::Bin, String> {
+    let bin = gst::Bin::new();
+    let convert = make("videoconvert")?;
+    let to_rgb = make("capsfilter")?;
+    to_rgb.set_property(
+        "caps",
+        gst::Caps::builder("video/x-raw")
+            .field("format", "RGB")
+            .build(),
+    );
+    let sink = gst_app::AppSink::builder()
+        .max_buffers(1)
+        .drop(true)
+        .sync(false)
+        .build();
+    sink.set_async(false);
+    let src = gst_app::AppSrc::builder()
+        .is_live(true)
+        .format(gst::Format::Time)
+        .do_timestamp(true)
+        .build();
+    let queue = make("queue")?;
+    queue.set_property("max-size-buffers", 2u32);
+    queue.set_property_from_str("leaky", "downstream");
+    bin.add_many([
+        &convert,
+        &to_rgb,
+        sink.upcast_ref(),
+        src.upcast_ref(),
+        &queue,
+    ])
+    .map_err(|e| e.to_string())?;
+    gst::Element::link_many([&convert, &to_rgb, sink.upcast_ref()]).map_err(|e| e.to_string())?;
+    src.link(&queue).map_err(|e| e.to_string())?;
+    let ghost_sink = gst::GhostPad::with_target(&convert.static_pad("sink").ok_or("no sink")?)
+        .map_err(|e| e.to_string())?;
+    let ghost_src = gst::GhostPad::with_target(&queue.static_pad("src").ok_or("no src")?)
+        .map_err(|e| e.to_string())?;
+    bin.add_pad(&ghost_sink).map_err(|e| e.to_string())?;
+    bin.add_pad(&ghost_src).map_err(|e| e.to_string())?;
+
+    // Frames in: to the matting threads, remembering the frame rate so the
+    // frames out can carry it.
+    let rate: Arc<Mutex<gst::Fraction>> = Arc::new(Mutex::new(gst::Fraction::new(30, 1)));
+    let out_caps: Arc<Mutex<Option<(usize, usize)>>> = Arc::default();
+    let matting = Arc::new(crate::matte::Matting::start({
+        let src = src.clone();
+        let rate = rate.clone();
+        move |frame: Frame| {
+            let mut known = out_caps.lock().unwrap_or_else(|e| e.into_inner());
+            if *known != Some((frame.width, frame.height)) {
+                let fps = *rate.lock().unwrap_or_else(|e| e.into_inner());
+                src.set_caps(Some(
+                    &gst::Caps::builder("video/x-raw")
+                        .field("format", "RGB")
+                        .field("width", frame.width as i32)
+                        .field("height", frame.height as i32)
+                        .field("framerate", fps)
+                        .build(),
+                ));
+                *known = Some((frame.width, frame.height));
+            }
+            drop(known);
+            let mut buffer =
+                gst::Buffer::with_size(frame.width * frame.height * 3).expect("a frame buffer");
+            {
+                let b = buffer.get_mut().expect("a fresh buffer");
+                let mut map = b.map_writable().expect("a writable buffer");
+                let row = frame.width * 3;
+                for (src_row, dst) in frame
+                    .rgb
+                    .chunks(frame.stride)
+                    .take(frame.height)
+                    .zip(map.as_mut_slice().chunks_mut(row))
+                {
+                    dst.copy_from_slice(&src_row[..row]);
+                }
+            }
+            let _ = src.push_buffer(buffer);
+        }
+    })?);
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Some(fps) = sample
+                    .caps()
+                    .and_then(|c| c.structure(0))
+                    .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+                {
+                    if fps.numer() > 0 {
+                        *rate.lock().unwrap_or_else(|e| e.into_inner()) = fps;
+                    }
+                }
+                if let Some(frame) = frame_from_sample(&sample) {
+                    matting.push(frame);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    Ok(bin)
 }
 
 /// Caps for the analysis branch: RGB, square pixels, at most `max_width`

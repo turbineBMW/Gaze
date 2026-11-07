@@ -96,10 +96,22 @@ ordered by value for effort; each one leaves the app working and shippable.
 - [x] Scan Document to PDF (Ctrl+Shift+D): the page is found, straightened
       and saved as an A4 PDF with an invisible text layer from ocrs.
 - [x] Time-lapse recordings (5x to 120x) and motion-triggered capture.
-- [ ] GIF capture.
-- [ ] Background blur or replacement (ONNX segmentation through rten,
-      which Gaze already carries for ocrs). Auto-framing is the ISP relay's
-      job on the Surface.
+- [x] GIF capture: a third mode next to Photo and Video; up to eight
+      seconds at 480 px, 12 fps, looping.
+- [x] Blur Background (Ctrl+B): Robust Video Matting (MobileNetV3, 15 MB,
+      fetched on first use) through rten gives the person alpha at about
+      10 fps on three cores; every frame is composited over a blurred copy
+      of itself in a second pipeline slot, so photos, recordings and the
+      virtual camera get it too.
+- [ ] Background replacement (a picture instead of the blur) is the same
+      composite with a different backdrop.
+- Auto-framing is the ISP relay's job on the Surface.
+
+## Also done
+
+- `gaze --do ACTION [VALUE]` drives a running Gaze over D-Bus, for
+  Hyprland keybindings: `gaze --do shutter`, `gaze --do mode gif`,
+  `gaze --do effect twirl`, `gaze --do background-blur`, `gaze --do quit`.
 
 ## Also worth having
 

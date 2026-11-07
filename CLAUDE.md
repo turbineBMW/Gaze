@@ -35,12 +35,15 @@ src/controls.rs  V4L2 controls over raw ioctls (struct sizes tested); popover ro
 src/scan.rs      document scan: Otsu + largest region -> quad, homography warp,
                  hand-written PDF with a JPEG page and an invisible text layer
 src/motion.rs    frame-difference motion score (tested)
+src/gifcap.rs    GIF mode: frames from a tap, encoded with the gif crate
+src/matte.rs     background blur: RVM through rten on a matting thread (throttled to
+                 10 fps, 3-thread pool), fixed-point composite thread; model in ~/.cache/gaze/rvm
 src/thumbs.rs    live effect thumbnails: appsrc -> glupload -> tee -> gleffects x16
 src/stats.rs     colour statistics of an RGB frame (unit-tested)
 src/omarchy.rs   Omarchy colors.toml -> libadwaita CSS (port of Rustle's; tested)
 src/theme.rs     applies it and follows theme changes live
 src/settings.rs  ~/.config/gaze/settings (camera, mirror, timer, virtual_camera,
-                 grid, mic, lapse, format.<camera>)
+                 grid, mic, lapse, background_blur, format.<camera>)
 docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
 ```
 
@@ -54,11 +57,13 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
   scaled and rate-limited to the union of them, and tap handlers run on the
   streaming thread (hand frames to the main loop via `LatestFrame` or a
   channel).
-- The effect slot (`identity` or `glupload ! glcolorconvert ! gleffects !
-  gldownload ! capsfilter video/x-raw`) is swapped inside a BLOCK_DOWNSTREAM
-  probe on the capsfilter's src pad: unlink, NULL and remove the old, add,
-  link and sync the new, all on the streaming thread. The trailing
-  capsfilter keeps the tee in system memory.
+- Two slots sit between the capsfilter and the tee: the effect slot
+  (`identity` or `glupload ! glcolorconvert ! gleffects ! gldownload !
+  capsfilter video/x-raw`) and the background slot (`identity` or a bin
+  whose appsink hands frames to the matting threads and whose appsrc
+  returns them composited). `Camera::swap_slot` swaps either inside a
+  BLOCK_DOWNSTREAM probe on the upstream pad: unlink, NULL and remove the
+  old, add, link and sync the new, all on the streaming thread.
 - Caps are forced to system-memory raw video so every branch gets the same
   frames; `videoconvert` does YUV -> RGB with the stream's colorimetry, which
   is what keeps photos and stats correct for limited-range cameras.
@@ -75,7 +80,8 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
   the recorder; bus errors from inside it become `Event::OutputFailed` and
   only that branch is dropped. The loopback device is exclusive-caps, so
   readers fail to open it while Gaze is not feeding it: expected.
-- Window actions are on D-Bus at `/io/github/turbinebmw/Gaze/window/1`
+- `gaze --do ACTION [VALUE]` is the scripted way in (main.rs builds the
+  `(sava{sv})` Activate call). Window actions are on D-Bus at `/io/github/turbinebmw/Gaze/window/1`
   (`org.gtk.Actions.Activate`), handy for scripted tests:
   `gdbus call --session --dest io.github.turbinebmw.Gaze --object-path /io/github/turbinebmw/Gaze/window/1 --method org.gtk.Actions.Activate shutter [] {}`
 - Never `pkill gaze` while it streams the Surface front camera: the ISP relay
