@@ -409,17 +409,34 @@ struct Pauses {
     pause_at: Option<gst::ClockTime>,
     resume_at: gst::ClockTime,
     shift: u64,
+    /// Time-lapse: keep one frame in `lapse` and squeeze the stamps by as
+    /// much (1 or 0: off). Video only; a time-lapse has no sound.
+    lapse: u64,
+    seen: u64,
+    lapse_start: Option<gst::ClockTime>,
 }
 
 impl Pauses {
     /// What to do with a buffer stamped `pts`: `None` drops it, otherwise
     /// the stamp to give it.
-    fn apply(&self, pts: gst::ClockTime) -> Option<gst::ClockTime> {
+    fn apply(&mut self, pts: gst::ClockTime) -> Option<gst::ClockTime> {
         if self.pause_at.is_some_and(|p| pts >= p) || pts < self.resume_at {
             return None;
         }
+        let pts = pts.nseconds().saturating_sub(self.shift);
+        if self.lapse <= 1 {
+            return Some(gst::ClockTime::from_nseconds(pts));
+        }
+        let keep = self.seen.is_multiple_of(self.lapse);
+        self.seen += 1;
+        if !keep {
+            return None;
+        }
+        let start = *self
+            .lapse_start
+            .get_or_insert(gst::ClockTime::from_nseconds(pts));
         Some(gst::ClockTime::from_nseconds(
-            pts.nseconds().saturating_sub(self.shift),
+            start.nseconds() + pts.saturating_sub(start.nseconds()) / self.lapse,
         ))
     }
 }
@@ -760,20 +777,31 @@ impl Camera {
     }
 
     /// Start recording the camera and a microphone (`None`: the default) to
-    /// `path` (H.264 on the GPU through VA-API, AAC, MP4).
-    pub fn start_recording(&self, path: &Path, mic: Option<&str>) -> Result<(), String> {
+    /// `path` (H.264 on the GPU through VA-API, AAC, MP4). A `lapse` above
+    /// 1 makes a time-lapse that many times faster, without sound.
+    pub fn start_recording(
+        &self,
+        path: &Path,
+        mic: Option<&str>,
+        lapse: u32,
+    ) -> Result<(), String> {
         if self.is_recording() {
             return Ok(());
         }
-        let description = format!(
+        let video = format!(
             "queue name=vq max-size-buffers=0 max-size-bytes=0 max-size-time=2000000000 \
                ! videoconvert ! vah264enc bitrate=8000 ! h264parse \
-               ! mp4mux name=mux ! filesink name=out location=\"{}\" \
-             pulsesrc name=mic ! queue name=aq max-size-time=2000000000 ! audioconvert \
-               ! level interval=100000000 ! audioresample \
-               ! audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=160000 ! aacparse ! mux.",
+               ! mp4mux name=mux ! filesink name=out location=\"{}\"",
             path.display().to_string().replace('"', "\\\"")
         );
+        let audio = "pulsesrc name=mic ! queue name=aq max-size-time=2000000000 ! audioconvert \
+               ! level interval=100000000 ! audioresample \
+               ! audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=160000 ! aacparse ! mux.";
+        let description = if lapse > 1 {
+            video
+        } else {
+            format!("{video} {audio}")
+        };
         let bin = gst::parse::bin_from_description(&description, true)
             .map_err(|e| format!("cannot build the recorder: {e}"))?;
         bin.set_property("message-forward", true);
@@ -785,7 +813,10 @@ impl Camera {
         // Pausing: the queues' probes drop or restamp buffers. Pad offsets
         // move the segment, not the stamps, so buffers carry pipeline
         // running time and Pauses works in that.
-        *self.pauses.lock().unwrap_or_else(|e| e.into_inner()) = Pauses::default();
+        *self.pauses.lock().unwrap_or_else(|e| e.into_inner()) = Pauses {
+            lapse: lapse.max(1) as u64,
+            ..Pauses::default()
+        };
         for queue in ["vq", "aq"] {
             let Some(pad) = bin.by_name(queue).and_then(|q| q.static_pad("sink")) else {
                 continue;
@@ -1062,7 +1093,7 @@ fn tap_caps(max_width: Option<u32>) -> gst::Caps {
     caps.build()
 }
 
-fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
+pub(crate) fn frame_from_sample(sample: &gst::Sample) -> Option<Frame> {
     let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;

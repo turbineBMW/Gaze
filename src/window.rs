@@ -6,9 +6,12 @@ use crate::camera::{
 };
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::controls;
-use crate::settings::{Settings, TIMERS};
+use crate::motion;
+use crate::scan;
+use crate::settings::{Settings, LAPSES, TIMERS};
 use crate::stats::{self, Region};
 use crate::text;
+use crate::thumbs::{Previews, Thumb};
 use crate::vcam;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -74,6 +77,9 @@ struct Ui {
     /// The camera controls popover's content, rebuilt per camera.
     controls_box: gtk::Box,
     controls_button: gtk::MenuButton,
+    /// The effects picker and its live tiles, by effect id ("none" too).
+    effects_button: gtk::MenuButton,
+    effect_pictures: Vec<(&'static str, gtk::Picture)>,
 }
 
 pub struct Window {
@@ -123,6 +129,19 @@ pub struct Window {
     paused_at: Cell<Option<Instant>>,
     /// The open camera's V4L2 node, for its controls.
     device_path: RefCell<Option<PathBuf>>,
+    /// Motion-triggered capture: on, its tap, the frames, the last one
+    /// compared, and when the last photo was taken.
+    motion_on: Cell<bool>,
+    motion_tap: Cell<Option<TapId>>,
+    motion_frames: LatestFrame,
+    motion_prev: RefCell<Option<camera::Frame>>,
+    motion_last_shot: Cell<Option<Instant>>,
+    lapse: Cell<u32>,
+    /// The page found by Scan Document, outlined while it is processed.
+    scan_quad: RefCell<Option<scan::Quad>>,
+    /// The effects picker's live previews while it is open.
+    previews: RefCell<Option<Previews>>,
+    thumb_sender: async_channel::Sender<Thumb>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -140,6 +159,7 @@ impl Window {
         // The scanner's worker thread sends each scan here; only the newest
         // unread one is kept.
         let (code_sender, code_receiver) = async_channel::bounded::<Vec<Code>>(1);
+        let (thumb_sender, thumb_receiver) = async_channel::bounded::<Thumb>(64);
         let this = Rc::new(Self {
             ui,
             mirror: Cell::new(settings.mirror),
@@ -170,6 +190,15 @@ impl Window {
             paused_total: Cell::new(Duration::ZERO),
             paused_at: Cell::new(None),
             device_path: RefCell::new(None),
+            motion_on: Cell::new(false),
+            motion_tap: Cell::new(None),
+            motion_frames: LatestFrame::default(),
+            motion_prev: RefCell::new(None),
+            motion_last_shot: Cell::new(None),
+            lapse: Cell::new(settings.lapse),
+            scan_quad: RefCell::new(None),
+            previews: RefCell::new(None),
+            thumb_sender,
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -188,6 +217,15 @@ impl Window {
             async move {
                 while let Ok(codes) = code_receiver.recv().await {
                     this.on_codes(codes);
+                }
+            }
+        ));
+        glib::spawn_future_local(glib::clone!(
+            #[weak]
+            this,
+            async move {
+                while let Ok((id, frame)) = thumb_receiver.recv().await {
+                    this.on_thumb(id, frame);
                 }
             }
         ));
@@ -234,6 +272,18 @@ impl Window {
             move |_| this.stop_burst()
         ));
         ui.shutter.add_controller(hold);
+        if let Some(popover) = ui.effects_button.popover() {
+            popover.connect_show(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| this.start_previews()
+            ));
+            popover.connect_hide(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| this.stop_previews()
+            ));
+        }
         ui.gallery.connect_child_activated(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -367,6 +417,34 @@ impl Window {
                     }
                 }
                 drop(codes);
+                if let Some(quad) = *this.scan_quad.borrow() {
+                    let accent = adw::StyleManager::default().accent_color_rgba();
+                    for (i, (x, y)) in quad.iter().enumerate() {
+                        let x = if mirrored { 1.0 - x } else { *x };
+                        let (px, py) = (vx + x * vw, vy + y * vh);
+                        if i == 0 {
+                            cr.move_to(px, py);
+                        } else {
+                            cr.line_to(px, py);
+                        }
+                    }
+                    cr.close_path();
+                    cr.set_source_rgba(
+                        accent.red() as f64,
+                        accent.green() as f64,
+                        accent.blue() as f64,
+                        0.25,
+                    );
+                    let _ = cr.fill_preserve();
+                    cr.set_source_rgba(
+                        accent.red() as f64,
+                        accent.green() as f64,
+                        accent.blue() as f64,
+                        1.0,
+                    );
+                    cr.set_line_width(3.0);
+                    let _ = cr.stroke();
+                }
                 if this.grid.get() {
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
                     cr.set_line_width(1.0);
@@ -612,6 +690,26 @@ impl Window {
         window.add_action(&gallery);
         app.set_accels_for_action("win.gallery", &["<Control><Shift>g"]);
 
+        // Scan the page in front of the camera to a PDF.
+        let scan_doc = gio::SimpleAction::new("scan-document", None);
+        scan_doc.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.scan_document()
+        ));
+        window.add_action(&scan_doc);
+        app.set_accels_for_action("win.scan-document", &["<Control><Shift>d"]);
+
+        // The effects picker, from the keyboard.
+        let effects_action = gio::SimpleAction::new("effects", None);
+        effects_action.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.ui.effects_button.popup()
+        ));
+        window.add_action(&effects_action);
+        app.set_accels_for_action("win.effects", &["<Control><Shift>e"]);
+
         // The camera controls popover, from the keyboard.
         let controls_action = gio::SimpleAction::new("controls", None);
         controls_action.connect_activate(glib::clone!(
@@ -631,6 +729,35 @@ impl Window {
         ));
         window.add_action(&copy_last);
         app.set_accels_for_action("win.copy-last", &["<Control><Shift>c"]);
+
+        // Keep the virtual camera device across reboots: a system service
+        // installed (or removed) through pkexec.
+        let permanent = gio::SimpleAction::new_stateful(
+            "virtual-camera-permanent",
+            None,
+            &vcam::service_installed().to_variant(),
+        );
+        permanent.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let want = !vcam::service_installed();
+                let action = action.clone();
+                let this = this.clone();
+                glib::spawn_future_local(async move {
+                    match vcam::set_service(want).await {
+                        Ok(()) => this.ui.toasts.add_toast(adw::Toast::new(if want {
+                            "The virtual camera will be there after every boot"
+                        } else {
+                            "The virtual camera will need a prompt after a reboot"
+                        })),
+                        Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&error)),
+                    }
+                    action.set_state(&vcam::service_installed().to_variant());
+                });
+            }
+        ));
+        window.add_action(&permanent);
 
         let close_code = gio::SimpleAction::new("close-code", None);
         close_code.connect_activate(glib::clone!(
@@ -701,6 +828,52 @@ impl Window {
         ));
         window.add_action(&cancel);
         app.set_accels_for_action("win.cancel", &["Escape"]);
+
+        // Motion-triggered photos.
+        let motion = gio::SimpleAction::new_stateful("motion", None, &false.to_variant());
+        motion.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let on = !this.motion_on.get();
+                this.motion_on.set(on);
+                action.set_state(&on.to_variant());
+                this.motion_prev.replace(None);
+                this.sync_motion_tap();
+                this.ui.toasts.add_toast(adw::Toast::new(if on {
+                    "Motion capture on: a photo whenever something moves"
+                } else {
+                    "Motion capture off"
+                }));
+            }
+        ));
+        window.add_action(&motion);
+        app.set_accels_for_action("win.motion", &["<Control><Shift>m"]);
+
+        // Time-lapse speed for recordings, as a string for the menu.
+        let lapse = gio::SimpleAction::new_stateful(
+            "lapse",
+            Some(glib::VariantTy::STRING),
+            &self.lapse.get().to_string().to_variant(),
+        );
+        lapse.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, value| {
+                let Some(speed) = value
+                    .and_then(|v| v.str())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|s| LAPSES.contains(s))
+                else {
+                    return;
+                };
+                this.lapse.set(speed);
+                action.set_state(&speed.to_string().to_variant());
+                this.settings.borrow_mut().lapse = speed;
+                this.settings.borrow().save();
+            }
+        ));
+        window.add_action(&lapse);
 
         // Pause and resume the recording.
         let pause = gio::SimpleAction::new_stateful("pause", None, &false.to_variant());
@@ -921,13 +1094,16 @@ impl Window {
                 );
                 self.ui.picture.set_paintable(Some(&paintable));
                 self.stats_tap.set(None);
+                self.motion_tap.set(None);
                 self.scanner.replace(None);
+                self.previews.replace(None);
                 if let Err(error) = camera.set_effect(self.effect.get()) {
                     log::warn!("{error}");
                     self.effect.set(None);
                 }
                 self.camera.replace(Some(camera));
                 self.sync_stats_tap();
+                self.sync_motion_tap();
                 self.sync_scanner();
                 self.apply_effect_state();
                 if self.virtual_on.get() {
@@ -1382,7 +1558,29 @@ impl Window {
             )));
             text::download_models().await?;
         }
-        // One full-size frame from the analysis tap.
+        let frame = self.grab_frame().await?;
+        if !self.reading.get() {
+            return Ok(()); // cancelled meanwhile
+        }
+        self.freeze(&frame);
+        self.ui.text_title.set_label("Reading…");
+        self.ui.text_card.set_visible(true);
+        let lines = text::read(frame).await?;
+        if !self.frozen.get() {
+            return Ok(());
+        }
+        self.ui.text_title.set_label(&match lines.len() {
+            0 => "No text found".to_string(),
+            1 => "1 line".to_string(),
+            n => format!("{n} lines"),
+        });
+        self.text_lines.replace(lines);
+        self.build_chips();
+        Ok(())
+    }
+
+    /// One full-size frame from the analysis tap.
+    async fn grab_frame(&self) -> Result<camera::Frame, String> {
         let (tx, rx) = async_channel::bounded::<camera::Frame>(1);
         let tap = {
             let camera = self.camera.borrow();
@@ -1401,24 +1599,73 @@ impl Window {
         if let Some(camera) = self.camera.borrow().as_ref() {
             camera.remove_tap(tap);
         }
-        let frame = frame?;
+        frame
+    }
+
+    /// Freeze the picture, find the page in it, straighten it, read its
+    /// text, and save a PDF.
+    fn scan_document(self: &Rc<Self>) {
+        if self.reading.get() || self.frozen.get() || self.camera.borrow().is_none() {
+            return;
+        }
+        self.reading.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Err(error) = this.scan_document_inner().await {
+                this.ui.toasts.add_toast(adw::Toast::new(&error));
+            }
+            this.reading.set(false);
+            this.unfreeze();
+        });
+    }
+
+    async fn scan_document_inner(self: &Rc<Self>) -> Result<(), String> {
+        let frame = self.grab_frame().await?;
         if !self.reading.get() {
-            return Ok(()); // cancelled meanwhile
+            return Ok(());
         }
         self.freeze(&frame);
-        self.ui.text_title.set_label("Reading…");
+        self.ui.text_title.set_label("Finding the page…");
         self.ui.text_card.set_visible(true);
-        let lines = text::read(frame).await?;
+        let found = gio::spawn_blocking({
+            let frame = frame.clone();
+            move || scan::find_page(&frame)
+        })
+        .await
+        .map_err(|_| "scan thread failed".to_string())?;
+        let quad = found.unwrap_or([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+        self.scan_quad.replace(Some(quad));
+        self.ui.overlay.queue_draw();
+        self.ui.text_title.set_label(if found.is_some() {
+            "Straightening…"
+        } else {
+            "No page found: scanning the whole picture"
+        });
+        let page = gio::spawn_blocking(move || scan::warp(&frame, &quad))
+            .await
+            .map_err(|_| "scan thread failed".to_string())?;
+        let lines = if text::models_ready() {
+            self.ui.text_title.set_label("Reading the text…");
+            text::read(page.clone()).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !self.frozen.get() {
             return Ok(());
         }
-        self.ui.text_title.set_label(&match lines.len() {
-            0 => "No text found".to_string(),
-            1 => "1 line".to_string(),
-            n => format!("{n} lines"),
-        });
-        self.text_lines.replace(lines);
-        self.build_chips();
+        self.ui.text_title.set_label("Saving…");
+        let path = special_dir(glib::UserDirectory::Documents, "Documents")
+            .join(format!("Gaze Scan {}.pdf", timestamp()));
+        let thumb = scan::thumbnail(&page, camera::THUMBNAIL_WIDTH as usize);
+        let saved = gio::spawn_blocking({
+            let path = path.clone();
+            move || scan::write_pdf(&path, &page, &lines).map(|_| path)
+        })
+        .await
+        .map_err(|_| "scan thread failed".to_string())??;
+        self.add_capture(saved.clone(), Some(thumb), false);
+        self.notify_capture("Scan saved", &saved);
+        self.toast_file("Scan saved", saved);
         Ok(())
     }
 
@@ -1440,6 +1687,9 @@ impl Window {
     /// Back to the live picture, without the chips.
     fn unfreeze(&self) {
         self.reading.set(false);
+        if self.scan_quad.take().is_some() {
+            self.ui.overlay.queue_draw();
+        }
         if self.frozen.replace(false) {
             if let Some(camera) = self.camera.borrow().as_ref() {
                 self.ui.picture.set_paintable(Some(&camera.paintable()));
@@ -1546,6 +1796,127 @@ impl Window {
                 }
             }
         });
+    }
+
+    fn start_previews(&self) {
+        if self.previews.borrow().is_some() {
+            return;
+        }
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            return;
+        };
+        match Previews::start(camera, self.thumb_sender.clone()) {
+            Ok(previews) => {
+                self.previews.replace(Some(previews));
+            }
+            Err(error) => log::warn!("effect previews: {error}"),
+        }
+    }
+
+    fn stop_previews(&self) {
+        if let Some(previews) = self.previews.take() {
+            if let Some(camera) = self.camera.borrow().as_ref() {
+                previews.stop(camera);
+            }
+        }
+    }
+
+    /// A thumbnail from the previews: onto its tile.
+    fn on_thumb(&self, id: &'static str, frame: camera::Frame) {
+        if self.previews.borrow().is_none() {
+            return;
+        }
+        let Some((_, picture)) = self.ui.effect_pictures.iter().find(|(i, _)| *i == id) else {
+            return;
+        };
+        let bytes = glib::Bytes::from(&frame.rgb);
+        let texture = gdk::MemoryTexture::new(
+            frame.width as i32,
+            frame.height as i32,
+            gdk::MemoryFormat::R8g8b8,
+            &bytes,
+            frame.stride,
+        );
+        picture.set_paintable(Some(&texture));
+    }
+
+    /// Take a photo of the frame on screen and file it.
+    fn snap_photo(self: &Rc<Self>, title: &'static str) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            return;
+        };
+        let path = photos_dir().join(format!("Gaze {}.jpg", timestamp()));
+        self.flash();
+        let this = self.clone();
+        let photo = camera.take_photo(path);
+        glib::spawn_future_local(async move {
+            match photo.await {
+                Ok((path, thumb)) => {
+                    this.add_capture(path.clone(), thumb, false);
+                    this.notify_capture(title, &path);
+                    this.toast_file(title, path);
+                }
+                Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not save the photo: {error}"
+                ))),
+            }
+        });
+    }
+
+    /// Tap the open camera for motion detection exactly while it is on.
+    fn sync_motion_tap(&self) {
+        let camera = self.camera.borrow();
+        let Some(camera) = camera.as_ref() else {
+            self.motion_tap.set(None);
+            return;
+        };
+        match (self.motion_on.get(), self.motion_tap.get()) {
+            (true, None) => {
+                let frames = self.motion_frames.clone();
+                let tap = Tap {
+                    max_width: Some(320),
+                    fps: 5,
+                };
+                let id = camera.add_tap(tap, move |frame| frames.store(frame));
+                self.motion_tap.set(Some(id));
+            }
+            (false, Some(id)) => {
+                camera.remove_tap(id);
+                self.motion_tap.set(None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Compare the newest motion frame with the last one; a photo when
+    /// enough changed, at most one every few seconds.
+    fn check_motion(self: &Rc<Self>) {
+        let Some(frame) = self.motion_frames.take() else {
+            return;
+        };
+        let moved = self
+            .motion_prev
+            .borrow()
+            .as_ref()
+            .map_or(0.0, |prev| motion::changed(prev, &frame));
+        self.motion_prev.replace(Some(frame));
+        let cooling = self
+            .motion_last_shot
+            .get()
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+        let busy = self.counting_down()
+            || self.frozen.get()
+            || self
+                .camera
+                .borrow()
+                .as_ref()
+                .is_some_and(Camera::is_recording);
+        if moved >= motion::MOTION && !cooling && !busy {
+            self.motion_last_shot.set(Some(Instant::now()));
+            self.snap_photo("Motion: photo saved");
+        }
     }
 
     /// Remember a capture: the thumbnail button shows it and the gallery
@@ -1866,24 +2237,7 @@ impl Window {
             return;
         };
         match self.mode.get() {
-            Mode::Photo => {
-                let path = photos_dir().join(format!("Gaze {}.jpg", timestamp()));
-                self.flash();
-                let this = self.clone();
-                let photo = camera.take_photo(path);
-                glib::spawn_future_local(async move {
-                    match photo.await {
-                        Ok((path, thumb)) => {
-                            this.add_capture(path.clone(), thumb, false);
-                            this.notify_capture("Photo saved", &path);
-                            this.toast_file("Photo saved", path);
-                        }
-                        Err(error) => this.ui.toasts.add_toast(adw::Toast::new(&format!(
-                            "Could not save the photo: {error}"
-                        ))),
-                    }
-                });
-            }
+            Mode::Photo => self.snap_photo("Photo saved"),
             Mode::Video => {
                 if camera.is_recording() {
                     if self.recording_since.get().is_some() {
@@ -1900,7 +2254,7 @@ impl Window {
                         return;
                     }
                     let mic = self.settings.borrow().mic.clone();
-                    match camera.start_recording(&path, mic.as_deref()) {
+                    match camera.start_recording(&path, mic.as_deref(), self.lapse.get()) {
                         Ok(()) => {
                             self.recording_since.set(Some(Instant::now()));
                             self.paused_total.set(Duration::ZERO);
@@ -1975,7 +2329,7 @@ impl Window {
         adw::TimedAnimation::new(flash, 0.8, 0.0, 250, target).play();
     }
 
-    fn tick(&self) {
+    fn tick(self: &Rc<Self>) {
         if let Some(since) = self.recording_since.get() {
             let paused = self.paused_total.get()
                 + self
@@ -1983,9 +2337,15 @@ impl Window {
                     .get()
                     .map_or(Duration::ZERO, |at| at.elapsed());
             let s = since.elapsed().saturating_sub(paused).as_secs();
-            self.ui
-                .timer
-                .set_label(&format!("{:02}:{:02}", s / 60, s % 60));
+            let lapse = self.lapse.get();
+            self.ui.timer.set_label(&if lapse > 1 {
+                format!("{lapse}× {:02}:{:02}", s / 60, s % 60)
+            } else {
+                format!("{:02}:{:02}", s / 60, s % 60)
+            });
+        }
+        if self.motion_on.get() {
+            self.check_motion();
         }
         if !self.stats_on.get() {
             return;
@@ -2084,13 +2444,31 @@ fn build_ui(app: &adw::Application) -> Ui {
     picture_menu.append_submenu(Some("Format"), &formats_menu);
     let mics_menu = gio::Menu::new();
     picture_menu.append_submenu(Some("Microphone"), &mics_menu);
+    let lapse_menu = gio::Menu::new();
+    for speed in LAPSES {
+        let label = if speed == 1 {
+            "Off".to_string()
+        } else {
+            format!("{speed}× faster")
+        };
+        let item = gio::MenuItem::new(Some(&label), None);
+        item.set_action_and_target_value(Some("win.lapse"), Some(&speed.to_string().to_variant()));
+        lapse_menu.append_item(&item);
+    }
+    picture_menu.append_submenu(Some("Time-lapse"), &lapse_menu);
     picture_menu.append(Some("Grid"), Some("win.grid"));
     picture_menu.append(Some("Fullscreen"), Some("win.fullscreen"));
     menu.append_section(None, &picture_menu);
     let view = gio::Menu::new();
     view.append(Some("Mirror Preview"), Some("win.mirror"));
     view.append(Some("Scan Codes"), Some("win.scan"));
+    view.append(Some("Motion Capture"), Some("win.motion"));
+    view.append(Some("Scan Document to PDF"), Some("win.scan-document"));
     view.append(Some("Virtual Camera"), Some("win.virtual-camera"));
+    view.append(
+        Some("Keep Virtual Camera After Reboot"),
+        Some("win.virtual-camera-permanent"),
+    );
     view.append(Some("Colour Statistics"), Some("win.stats"));
     menu.append_section(None, &view);
     let files = gio::Menu::new();
@@ -2357,7 +2735,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         .build();
     left.append(&mode_toggle);
     left.append(&timer_button);
-    left.append(&effects_button());
+    let (effects_button, effect_pictures) = effects_button();
+    left.append(&effects_button);
     let controls_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -2565,6 +2944,8 @@ fn build_ui(app: &adw::Application) -> Ui {
         gallery,
         controls_box,
         controls_button,
+        effects_button,
+        effect_pictures,
     }
 }
 
@@ -2645,9 +3026,10 @@ async fn run(argv: &[&str]) -> Result<(), String> {
     }
 }
 
-/// The effects picker: a popover with a grid of radio buttons over
-/// win.effect, distortions first, then colours, like Photo Booth's pages.
-fn effects_button() -> gtk::MenuButton {
+/// The effects picker: a popover with a grid of live tiles (radio buttons
+/// over win.effect), distortions first, then colours, like Photo Booth's
+/// pages. Returns the button and each tile's picture by effect id.
+fn effects_button() -> (gtk::MenuButton, Vec<(&'static str, gtk::Picture)>) {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
@@ -2656,17 +3038,41 @@ fn effects_button() -> gtk::MenuButton {
         .margin_start(6)
         .margin_end(6)
         .build();
-    let tile = |label: &str, id: &str| {
+    let mut pictures = Vec::new();
+    let mut tile = |label: &str, id: &'static str| {
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .build();
+        let frame = gtk::Overlay::builder()
+            .child(
+                &gtk::Box::builder()
+                    .width_request(112)
+                    .height_request(63)
+                    .build(),
+            )
+            .overflow(gtk::Overflow::Hidden)
+            .halign(gtk::Align::Center)
+            .build();
+        frame.add_css_class("tile-frame");
+        frame.add_overlay(&picture);
+        frame.set_clip_overlay(&picture, true);
+        let inner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(3)
+            .build();
+        inner.append(&frame);
+        inner.append(&gtk::Label::new(Some(label)));
         let button = gtk::ToggleButton::builder()
-            .label(label)
+            .child(&inner)
             .action_name("win.effect")
             .action_target(&id.to_variant())
             .build();
         button.add_css_class("flat");
+        pictures.push((id, picture));
         button
     };
     let none = tile("Normal", "none");
-    none.set_halign(gtk::Align::Fill);
+    none.set_halign(gtk::Align::Center);
     content.append(&none);
     for (title, distorts) in [("Distort", true), ("Colour", false)] {
         let heading = gtk::Label::builder().label(title).xalign(0.0).build();
@@ -2703,7 +3109,7 @@ fn effects_button() -> gtk::MenuButton {
         .build();
     button.add_css_class("osd");
     button.add_css_class("circular");
-    button
+    (button, pictures)
 }
 
 fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {

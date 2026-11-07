@@ -20,7 +20,12 @@ pub struct Settings {
     /// The microphone to record with (a PipeWire node name); `None` is the
     /// default one.
     pub mic: Option<String>,
+    /// Time-lapse speed for recordings; 1 is off.
+    pub lapse: u32,
 }
+
+/// The time-lapse speeds offered.
+pub const LAPSES: [u32; 6] = [1, 5, 10, 30, 60, 120];
 
 /// The self-timer lengths offered, in seconds.
 pub const TIMERS: [u32; 4] = [0, 3, 5, 10];
@@ -39,6 +44,7 @@ impl Settings {
             grid: false,
             formats: Vec::new(),
             mic: None,
+            lapse: 1,
         };
         let Ok(text) = std::fs::read_to_string(path()) else {
             return settings;
@@ -50,6 +56,13 @@ impl Settings {
                 Some(("virtual_camera", v)) => settings.virtual_camera = v.trim() == "true",
                 Some(("grid", v)) => settings.grid = v.trim() == "true",
                 Some(("mic", v)) if !v.trim().is_empty() => settings.mic = Some(v.trim().into()),
+                Some(("lapse", v)) => {
+                    if let Ok(l) = v.trim().parse::<u32>() {
+                        if LAPSES.contains(&l) {
+                            settings.lapse = l;
+                        }
+                    }
+                }
                 Some((key, v)) if key.starts_with("format.") && !v.trim().is_empty() => {
                     settings.set_format(&key["format.".len()..], Some(v.trim()));
                 }
@@ -100,6 +113,7 @@ impl Settings {
         if let Some(mic) = &self.mic {
             text.push_str(&format!("mic={mic}\n"));
         }
+        text.push_str(&format!("lapse={}\n", self.lapse));
         if let Err(error) = std::fs::write(&path, text) {
             log::warn!("cannot save {}: {error}", path.display());
         }
