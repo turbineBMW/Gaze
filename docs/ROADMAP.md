@@ -32,13 +32,15 @@ ordered by value for effort; each one leaves the app working and shippable.
 
 ## Phase 3: Text recognition with click-to-copy
 
-- A "Text" mode freezes the current frame, runs Tesseract in a worker
-  thread and lays semi-transparent buttons over each detected line at its
-  bounding box. Click copies the line; "Copy all" copies everything in
-  reading order. Freezing keeps the buttons still.
-- Pre-pass: greyscale, adaptive threshold, optional deskew.
-- Language picker from the installed tessdata.
-- Later: a live low-rate mode that highlights where text is; press to read.
+- [x] "Read Text" freezes the next full-size frame, runs it through ocrs
+      (pure Rust scene-text models, fetched once into `~/.cache/gaze/ocrs`,
+      12 MB) on a blocking thread, and lays a semi-transparent chip over
+      each line. Click copies the line; "Copy All" copies everything in
+      reading order; Done, Escape or the shutter go back to live.
+- [x] Chips follow the picture through resizes and mirroring.
+- [ ] A live low-rate mode that highlights where text is; press to read.
+- [ ] Other scripts: ocrs is Latin-only today. Tesseract behind the same
+      interface would add languages at the cost of C bindings.
 
 ## Phase 4: Photo Booth effects
 

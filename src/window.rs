@@ -5,6 +5,7 @@ use crate::camera::{self, Camera, CameraInfo, Effect, Event, LatestFrame, Tap, T
 use crate::codes::{self, Code, Payload, Scanner};
 use crate::settings::{Settings, TIMERS};
 use crate::stats::{self, Region};
+use crate::text;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
@@ -34,6 +35,11 @@ struct Ui {
     code_format: gtk::Label,
     code_text: gtk::Label,
     code_primary: gtk::Button,
+    /// Text mode: the chips over each line, and its card.
+    text_layer: gtk::Fixed,
+    text_card: gtk::Box,
+    text_title: gtk::Label,
+    read_text: gtk::ToggleButton,
     stats_labels: Vec<gtk::Label>,
     swatch: gtk::DrawingArea,
     cameras_dropdown: gtk::DropDown,
@@ -69,6 +75,11 @@ pub struct Window {
     /// A dismissed code's text: not shown again until it leaves the frame.
     dismissed_code: RefCell<Option<String>>,
     effect: Cell<Option<&'static Effect>>,
+    /// Text mode: the frozen frame's lines and their chips, if reading.
+    text_lines: RefCell<Vec<text::Line>>,
+    text_chips: RefCell<Vec<gtk::Button>>,
+    frozen: Cell<bool>,
+    reading: Cell<bool>,
     /// Region being measured, in displayed (possibly mirrored) coordinates.
     region: Cell<Option<Region>>,
     drag_start: Cell<Option<(f64, f64)>>,
@@ -102,6 +113,10 @@ impl Window {
             shown_code: RefCell::new(None),
             dismissed_code: RefCell::new(None),
             effect: Cell::new(None),
+            text_lines: RefCell::new(Vec::new()),
+            text_chips: RefCell::new(Vec::new()),
+            frozen: Cell::new(false),
+            reading: Cell::new(false),
             settings: RefCell::new(settings),
             cameras: RefCell::new(Vec::new()),
             camera: RefCell::new(None),
@@ -268,6 +283,11 @@ impl Window {
                 let _ = cr.stroke();
             }
         ));
+        ui.overlay.connect_resize(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _, _| this.layout_chips()
+        ));
         ui.code_primary.connect_clicked(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -424,6 +444,38 @@ impl Window {
         window.add_action(&effect);
         app.set_accels_for_action("win.effect::none", &["<Control>0"]);
 
+        // Read the text in the picture (freezes it), or go back to live.
+        let read = gio::SimpleAction::new_stateful("read-text", None, &false.to_variant());
+        read.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                if this.frozen.get() || this.reading.get() {
+                    this.unfreeze();
+                } else {
+                    this.read_text();
+                }
+            }
+        ));
+        window.add_action(&read);
+        app.set_accels_for_action("win.read-text", &["<Control><Shift>t"]);
+
+        let copy_all = gio::SimpleAction::new("copy-all-text", None);
+        copy_all.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                let lines = this.text_lines.borrow();
+                if lines.is_empty() {
+                    return;
+                }
+                let text: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+                this.ui.window.clipboard().set_text(&text.join("\n"));
+                this.ui.toasts.add_toast(adw::Toast::new("Copied all text"));
+            }
+        ));
+        window.add_action(&copy_all);
+
         let close_code = gio::SimpleAction::new("close-code", None);
         close_code.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
@@ -481,7 +533,10 @@ impl Window {
         cancel.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_, _| this.cancel_countdown()
+            move |_, _| {
+                this.cancel_countdown();
+                this.unfreeze();
+            }
         ));
         window.add_action(&cancel);
         app.set_accels_for_action("win.cancel", &["Escape"]);
@@ -570,6 +625,7 @@ impl Window {
         {
             return;
         }
+        self.unfreeze();
         if let Some(camera) = self.camera.take() {
             camera.close();
         }
@@ -829,6 +885,145 @@ impl Window {
         self.apply_timer();
     }
 
+    /// Freeze the picture on the next frame and read the text in it.
+    fn read_text(self: &Rc<Self>) {
+        if self.reading.get() || self.camera.borrow().is_none() {
+            return;
+        }
+        self.reading.set(true);
+        self.ui.read_text.set_active(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Err(error) = this.read_text_inner().await {
+                this.ui.toasts.add_toast(adw::Toast::new(&error));
+                this.unfreeze();
+            }
+            this.reading.set(false);
+        });
+    }
+
+    async fn read_text_inner(self: &Rc<Self>) -> Result<(), String> {
+        if !text::models_ready() {
+            self.ui.toasts.add_toast(adw::Toast::new(&format!(
+                "Downloading the text recognition models ({})…",
+                text::MODELS_SIZE
+            )));
+            text::download_models().await?;
+        }
+        // One full-size frame from the analysis tap.
+        let (tx, rx) = async_channel::bounded::<camera::Frame>(1);
+        let tap = {
+            let camera = self.camera.borrow();
+            let camera = camera.as_ref().ok_or("no camera")?;
+            camera.add_tap(
+                Tap {
+                    max_width: None,
+                    fps: 30,
+                },
+                move |frame| {
+                    let _ = tx.try_send(frame.clone());
+                },
+            )
+        };
+        let frame = rx.recv().await.map_err(|_| "no frame".to_string());
+        if let Some(camera) = self.camera.borrow().as_ref() {
+            camera.remove_tap(tap);
+        }
+        let frame = frame?;
+        if !self.reading.get() {
+            return Ok(()); // cancelled meanwhile
+        }
+        self.freeze(&frame);
+        self.ui.text_title.set_label("Reading…");
+        self.ui.text_card.set_visible(true);
+        let lines = text::read(frame).await?;
+        if !self.frozen.get() {
+            return Ok(());
+        }
+        self.ui.text_title.set_label(&match lines.len() {
+            0 => "No text found".to_string(),
+            1 => "1 line".to_string(),
+            n => format!("{n} lines"),
+        });
+        self.text_lines.replace(lines);
+        self.build_chips();
+        Ok(())
+    }
+
+    /// Show `frame` instead of the live picture.
+    fn freeze(&self, frame: &camera::Frame) {
+        let bytes = glib::Bytes::from(&frame.rgb);
+        let texture = gtk::gdk::MemoryTexture::new(
+            frame.width as i32,
+            frame.height as i32,
+            gtk::gdk::MemoryFormat::R8g8b8,
+            &bytes,
+            frame.stride,
+        );
+        self.ui.picture.set_paintable(Some(&texture));
+        self.frozen.set(true);
+        self.ui.read_text.set_active(true);
+    }
+
+    /// Back to the live picture, without the chips.
+    fn unfreeze(&self) {
+        self.reading.set(false);
+        if self.frozen.replace(false) {
+            if let Some(camera) = self.camera.borrow().as_ref() {
+                self.ui.picture.set_paintable(Some(&camera.paintable()));
+            }
+        }
+        self.text_lines.borrow_mut().clear();
+        for chip in self.text_chips.borrow_mut().drain(..) {
+            self.ui.text_layer.remove(&chip);
+        }
+        self.ui.text_card.set_visible(false);
+        self.ui.read_text.set_active(false);
+    }
+
+    /// A chip per line, placed over it; click copies the line.
+    fn build_chips(self: &Rc<Self>) {
+        for chip in self.text_chips.borrow_mut().drain(..) {
+            self.ui.text_layer.remove(&chip);
+        }
+        let mut chips = Vec::new();
+        for line in self.text_lines.borrow().iter() {
+            let chip = gtk::Button::builder()
+                .label(&line.text)
+                .tooltip_text("Copy")
+                .build();
+            chip.add_css_class("text-chip");
+            let text = line.text.clone();
+            chip.connect_clicked(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| {
+                    this.ui.window.clipboard().set_text(&text);
+                    this.ui.toasts.add_toast(adw::Toast::new("Copied"));
+                }
+            ));
+            self.ui.text_layer.put(&chip, 0.0, 0.0);
+            chips.push(chip);
+        }
+        self.text_chips.replace(chips);
+        self.layout_chips();
+    }
+
+    /// Put each chip on its line in the displayed (maybe mirrored) picture.
+    fn layout_chips(&self) {
+        let Some((vx, vy, vw, vh)) = self.video_rect() else {
+            return;
+        };
+        let mirrored = self.mirror.get();
+        let lines = self.text_lines.borrow();
+        for (chip, line) in self.text_chips.borrow().iter().zip(lines.iter()) {
+            let (x, y, w, h) = line.bounds;
+            let x = if mirrored { 1.0 - x - w } else { x };
+            chip.set_size_request((w * vw) as i32, (h * vh) as i32);
+            self.ui.text_layer.move_(chip, vx + x * vw, vy + y * vh);
+        }
+    }
+
     fn set_effect(&self, effect: Option<&'static Effect>) {
         if let Some(camera) = self.camera.borrow().as_ref() {
             if let Err(error) = camera.set_effect(effect) {
@@ -955,6 +1150,10 @@ impl Window {
     fn shutter(self: &Rc<Self>) {
         if self.counting_down() {
             self.cancel_countdown();
+            return;
+        }
+        if self.frozen.get() || self.reading.get() {
+            self.unfreeze();
             return;
         }
         let recording = self
@@ -1321,6 +1520,45 @@ fn build_ui(app: &adw::Application) -> Ui {
     code_card.append(&code_text);
     code_card.append(&code_buttons);
 
+    // Text mode: a layer for the chips and a small card with Copy All.
+    let text_layer = gtk::Fixed::new();
+    let text_title = gtk::Label::builder()
+        .label("Reading…")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    text_title.add_css_class("heading");
+    let text_copy_all = gtk::Button::builder()
+        .label("Copy All")
+        .action_name("win.copy-all-text")
+        .build();
+    text_copy_all.add_css_class("pill");
+    text_copy_all.add_css_class("suggested-action");
+    let text_done = gtk::Button::builder()
+        .label("Done")
+        .action_name("win.read-text")
+        .build();
+    text_done.add_css_class("pill");
+    let text_buttons = gtk::Box::builder()
+        .spacing(8)
+        .halign(gtk::Align::Start)
+        .build();
+    text_buttons.append(&text_copy_all);
+    text_buttons.append(&text_done);
+    let text_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_top(12)
+        .margin_start(12)
+        .visible(false)
+        .build();
+    text_card.add_css_class("osd");
+    text_card.add_css_class("code");
+    text_card.append(&text_title);
+    text_card.append(&text_buttons);
+
     // Controls
     let mode_toggle = adw::ToggleGroup::new();
     mode_toggle.add(
@@ -1412,7 +1650,16 @@ fn build_ui(app: &adw::Application) -> Ui {
         .valign(gtk::Align::Center)
         .spacing(10)
         .build();
+    let read_text = gtk::ToggleButton::builder()
+        .icon_name("font-x-generic-symbolic")
+        .tooltip_text("Read Text")
+        .valign(gtk::Align::Center)
+        .build();
+    read_text.add_css_class("osd");
+    read_text.add_css_class("circular");
+    read_text.set_action_name(Some("win.read-text"));
     right.append(&timer);
+    right.append(&read_text);
     right.append(&scan_button);
     controls.set_end_widget(Some(&right));
 
@@ -1422,7 +1669,9 @@ fn build_ui(app: &adw::Application) -> Ui {
     overlay.add_overlay(&countdown);
     overlay.add_overlay(&flash);
     overlay.add_overlay(&stats_card);
+    overlay.add_overlay(&text_layer);
     overlay.add_overlay(&code_card);
+    overlay.add_overlay(&text_card);
     overlay.add_overlay(&controls);
 
     let status = adw::StatusPage::builder()
@@ -1461,6 +1710,10 @@ fn build_ui(app: &adw::Application) -> Ui {
         code_format,
         code_text,
         code_primary,
+        text_layer,
+        text_card,
+        text_title,
+        read_text,
         stats_labels,
         swatch,
         cameras_dropdown,
