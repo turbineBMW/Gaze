@@ -90,6 +90,19 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
   `(sava{sv})` Activate call). Window actions are on D-Bus at `/io/github/turbinebmw/Gaze/window/1`
   (`org.gtk.Actions.Activate`), handy for scripted tests:
   `gdbus call --session --dest io.github.turbinebmw.Gaze --object-path /io/github/turbinebmw/Gaze/window/1 --method org.gtk.Actions.Activate shutter [] {}`
+- PipeWire cameras (the Surface Pro 11 ISP node `sp11-ipe-preview`):
+  `pipewiresrc` hands out `pixel-aspect-ratio=1/2147483647`, which makes
+  `videoscale` fail with "integer overflow" in the analysis branch, so a
+  probe on the source pad rewrites absurd ratios to 1/1. The node's pool is
+  only 8 buffers; with `pipewireclock` as the pipeline clock, holding them
+  all (viewfinder, taps, GTK textures) deadlocks the sinks on a clock that
+  waits for them, so `provide-clock` is off. Test pipelines need
+  `! video/x-raw` after `pipewiresrc`: with ANY caps WirePlumber cannot
+  link the stream ("target not found").
+- Never take a GL pipeline to NULL on the main thread while frames flow:
+  closing the effects picker that way hung Gaze in Mesa on the SP11. The
+  thumbnails pipeline is kept for the camera's life (the picker only
+  detaches its tap) and is stopped with EOS, then NULL on a worker thread.
 - Never `pkill gaze` while it streams the Surface front camera: the ISP relay
   behind `/dev/video40` does not recover from an abrupt close and needs
   `systemctl restart v4l2-relayd@sp12-front`. Quit cleanly instead:

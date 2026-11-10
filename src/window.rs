@@ -2034,33 +2034,41 @@ impl Window {
         });
     }
 
+    /// Feed the effect thumbnails; the pipeline is built on first use and
+    /// kept until the camera changes.
     fn start_previews(&self) {
-        if self.previews.borrow().is_some() {
-            return;
-        }
         let camera = self.camera.borrow();
         let Some(camera) = camera.as_ref() else {
             return;
         };
+        let mut previews = self.previews.borrow_mut();
+        if let Some(previews) = previews.as_mut() {
+            previews.resume(camera);
+            return;
+        }
         match Previews::start(camera, self.thumb_sender.clone()) {
-            Ok(previews) => {
-                self.previews.replace(Some(previews));
-            }
+            Ok(started) => *previews = Some(started),
             Err(error) => log::warn!("effect previews: {error}"),
         }
     }
 
     fn stop_previews(&self) {
-        if let Some(previews) = self.previews.take() {
-            if let Some(camera) = self.camera.borrow().as_ref() {
-                previews.stop(camera);
-            }
+        if let (Some(previews), Some(camera)) = (
+            self.previews.borrow_mut().as_mut(),
+            self.camera.borrow().as_ref(),
+        ) {
+            previews.pause(camera);
         }
     }
 
     /// A thumbnail from the previews: onto its tile.
     fn on_thumb(&self, id: &'static str, frame: camera::Frame) {
-        if self.previews.borrow().is_none() {
+        if !self
+            .previews
+            .borrow()
+            .as_ref()
+            .is_some_and(Previews::is_live)
+        {
             return;
         }
         let Some((_, picture)) = self.ui.effect_pictures.iter().find(|(i, _)| *i == id) else {
