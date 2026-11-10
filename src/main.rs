@@ -29,24 +29,62 @@ pub const APP_ID: &str = "io.github.turbinebmw.Gaze";
 type AppState = Option<(theme::OmarchyTheme, Rc<window::Window>)>;
 
 const CSS: &str = "
+/* The rail's colours: black with white buttons, whatever the theme.
+ * --gaze-button-fg is what sits on a filled (checked) button. */
+:root { --gaze-bar: black; --gaze-button: white; --gaze-button-fg: black; }
+.rail {
+  background-color: color-mix(in srgb, var(--gaze-bar) 72%, transparent);
+  padding: 10px 0;
+}
+.rail label.timer, .rail label.timer-secs { color: var(--gaze-button); }
+button.rail-button, menubutton.rail-button > button,
+toggle-group.modes > toggle {
+  min-width: 38px; min-height: 38px; padding: 0; border-radius: 999px;
+  background: none; box-shadow: none; border: none;
+  color: var(--gaze-button);
+  -gtk-icon-size: 18px;
+}
+button.rail-button:hover, menubutton.rail-button > button:hover,
+toggle-group.modes > toggle:hover {
+  background-color: color-mix(in srgb, var(--gaze-button) 16%, transparent);
+}
+button.rail-button:active, menubutton.rail-button > button:active {
+  background-color: color-mix(in srgb, var(--gaze-button) 28%, transparent);
+}
+button.rail-button:checked, menubutton.rail-button > button:checked,
+toggle-group.modes > toggle:checked {
+  background-color: var(--gaze-button); color: var(--gaze-button-fg);
+}
+toggle-group.modes {
+  padding: 3px; border-radius: 999px; background: none;
+  border: 2px solid color-mix(in srgb, var(--gaze-button) 35%, transparent);
+}
+toggle-group.modes > separator { min-height: 0; background: none; }
+toggle-group.modes > toggle { min-width: 34px; min-height: 34px; }
+label.timer-secs { font-size: 9px; font-weight: bold; }
+popover.cameras button { min-height: 48px; padding: 0 16px; }
+/* Menus a finger can hit. */
+popover.menu modelbutton { min-height: 44px; }
 .viewfinder-frame { background-color: black; }
 picture.viewfinder.mirrored { transform: scaleX(-1); }
 .flash { background-color: white; }
 .stats, .code { padding: 12px 14px; border-radius: 12px; }
 .code { min-width: 280px; }
 .code .payload { font-family: monospace; }
-.timer { padding: 6px 12px; border-radius: 999px; font-weight: bold; }
+.timer { font-weight: bold; font-size: 12px; }
 label.countdown {
   font-size: 160px; font-weight: 800; color: white;
   text-shadow: 0 2px 24px rgb(0 0 0 / 70%);
 }
-menubutton.self-timer > button { padding-left: 10px; padding-right: 12px; }
 popover.effects button { min-width: 92px; padding: 4px; }
 popover.effects .tile-frame { border-radius: 8px; }
 popover.effects button label { font-size: 12px; }
 levelbar.mic-level trough { min-height: 8px; background-color: rgb(0 0 0 / 45%); border: none; }
 levelbar.mic-level block { min-height: 8px; }
-button.thumb { padding: 3px; border-radius: 12px; min-width: 0; min-height: 0; }
+menubutton.thumb > button {
+  padding: 3px; border-radius: 12px; min-width: 0; min-height: 0;
+  background: none; border: 2px solid var(--gaze-button);
+}
 .thumb-frame { border-radius: 9px; }
 .gallery button { padding: 2px; border-radius: 10px; }
 .gallery .thumb-frame { border-radius: 8px; }
@@ -58,24 +96,24 @@ button.text-chip {
 button.text-chip:hover { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
 button.text-chip label { font-size: 12px; }
 popover.effects button:checked { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
-/* Toasts sit above the shutter row instead of on it. */
-toast { margin-bottom: 100px; }
 button.shutter {
-  min-width: 68px; min-height: 68px; padding: 0; border-radius: 999px;
-  border: 4px solid white; background: none;
+  min-width: 46px; min-height: 46px; padding: 0; border-radius: 999px;
+  border: 3px solid var(--gaze-button); background: none;
   box-shadow: 0 0 0 2px rgb(0 0 0 / 35%), inset 0 0 0 2px rgb(0 0 0 / 35%);
 }
-button.shutter:hover { background-color: rgb(255 255 255 / 12%); }
+button.shutter:hover {
+  background-color: color-mix(in srgb, var(--gaze-button) 12%, transparent);
+}
 button.shutter > .inner {
-  min-width: 52px; min-height: 52px; border-radius: 999px;
+  min-width: 35px; min-height: 35px; border-radius: 999px;
   transition: all 150ms ease-out;
 }
-button.shutter.photo > .inner { background-color: white; }
+button.shutter.photo > .inner { background-color: var(--gaze-button); }
 button.shutter.video > .inner { background-color: var(--error-bg-color); }
 button.shutter.gif > .inner { background-color: var(--accent-bg-color); }
 button.shutter.gif.recording > .inner { background-color: var(--accent-bg-color); }
 button.shutter.recording > .inner {
-  min-width: 26px; min-height: 26px; border-radius: 6px;
+  min-width: 18px; min-height: 18px; border-radius: 4px;
   background-color: var(--error-bg-color);
 }
 ";

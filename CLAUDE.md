@@ -19,7 +19,8 @@ sh install.sh                                # ~/.local
 
 ```
 src/main.rs      app, stylesheet (shutter, toasts, mirror transform)
-src/window.rs    window, actions (win.shutter/record/mode/mirror/stats/scan/timer/
+src/window.rs    window and its right-hand control rail, actions (win.shutter/record/
+                 mode/camera/next-camera/mirror/stats/scan/timer/
                  effect/read-text/...), stats card, code card, text chips and card,
                  effects picker, overlay (region, outlines, countdown), toasts
 src/camera.rs    device list (V4L2 first, by node), the pipeline, photos, recording,
