@@ -145,6 +145,46 @@ fn default_caps(formats: &[Format]) -> gst::Caps {
         .build()
 }
 
+/// Whether a pixel aspect ratio is one no camera has. `pipewiresrc` (1.6.10)
+/// hands out 1/2147483647 when the node advertises none, and `videoscale`
+/// then fails with "integer overflow" in the analysis branch.
+fn absurd_par(par: gst::Fraction) -> bool {
+    let (n, d) = (par.numer() as i64, par.denom() as i64);
+    n <= 0 || d <= 0 || n * 16 < d || d * 16 < n
+}
+
+/// Rewrite the source's caps to square pixels when its pixel aspect ratio
+/// is absurd, so the effects, thumbnails, stats and recordings all see 1/1.
+fn square_pixels_if_absurd(pad: &gst::Pad) {
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+        let Some(gst::PadProbeData::Event(event)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(c) = event.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let caps = c.caps();
+        let bad = caps.iter().any(|s| {
+            s.get::<gst::Fraction>("pixel-aspect-ratio")
+                .is_ok_and(absurd_par)
+        });
+        if !bad {
+            return gst::PadProbeReturn::Ok;
+        }
+        let mut fixed = caps.to_owned();
+        for s in fixed.make_mut().iter_mut() {
+            if s.get::<gst::Fraction>("pixel-aspect-ratio")
+                .is_ok_and(absurd_par)
+            {
+                s.set("pixel-aspect-ratio", gst::Fraction::new(1, 1));
+            }
+        }
+        log::info!("camera caps had an absurd pixel-aspect-ratio; using 1/1");
+        info.data = Some(gst::PadProbeData::Event(gst::event::Caps::new(&fixed)));
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// The fixed raw formats in a device's caps, deduplicated, largest and
 /// fastest first. Frame-rate lists are expanded; ranges contribute their
 /// top.
@@ -513,6 +553,17 @@ impl Camera {
             }
             None => default_caps(&info.formats),
         };
+        if let Some(pad) = source.static_pad("src") {
+            square_pixels_if_absurd(&pad);
+        }
+        // pipewireclock only ticks while the producer can dequeue a buffer.
+        // Once the viewfinder, the analysis branch and GTK hold the whole
+        // pool (8 buffers on the SP11 ISP node), the sinks wait on a clock
+        // that waits on them: the picture freezes. The system clock keeps
+        // running, so the sinks render and give the buffers back.
+        if source.find_property("provide-clock").is_some() {
+            source.set_property("provide-clock", false);
+        }
         let filter = make("capsfilter")?;
         filter.set_property("caps", &caps);
         let effect = make("identity")?;
@@ -1371,6 +1422,17 @@ fn h264_encoder() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_absurd_pixel_aspect_ratios_are_replaced() {
+        let f = gst::Fraction::new;
+        assert!(absurd_par(f(1, i32::MAX)));
+        assert!(absurd_par(f(i32::MAX, 1)));
+        assert!(absurd_par(f(0, 1)));
+        assert!(!absurd_par(f(1, 1)));
+        assert!(!absurd_par(f(10, 11)));
+        assert!(!absurd_par(f(4, 3)));
+    }
 
     fn fmt(width: i32, height: i32) -> Format {
         Format {
