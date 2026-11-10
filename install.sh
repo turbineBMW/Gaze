@@ -44,7 +44,10 @@ if have_cmd gst-inspect-1.0; then
   have_element v4l2src || need "v4l2src, mp4mux (camera, recordings)" gst-plugins-good gstreamer1.0-plugins-good gstreamer1-plugins-good
   have_element pulsesrc || need "pulsesrc (microphone)" gst-plugins-good gstreamer1.0-pulseaudio gstreamer1-plugins-good
   have_element gleffects || need "gleffects (effects)" gst-plugins-base gstreamer1.0-gl gstreamer1-plugins-base
-  have_element vah264enc || need "vah264enc (H.264 on the GPU)" gst-plugin-va gstreamer1.0-plugins-bad gstreamer1-plugins-bad-free
+  # H.264: VA-API on Intel/AMD GPUs, a V4L2 hardware encoder on ARM boards,
+  # else x264 on the CPU (gst-plugin-va registers nothing without a VA driver).
+  have_element vah264enc || have_element v4l2h264enc || have_element x264enc \
+    || have_element openh264enc || need "an H.264 encoder (x264)" gst-plugins-ugly gstreamer1.0-plugins-ugly gstreamer1-plugins-ugly
   have_element avenc_aac || need "avenc_aac (AAC audio)" gst-libav gstreamer1.0-libav gstreamer1-libav
 fi
 
