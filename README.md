@@ -16,7 +16,8 @@ range, which makes everything look grey and flat; Gaze does not.
   (toggle with Ctrl+M).
 - Photos (Space or Enter) as JPEG in `~/Pictures/Camera`.
 - Video with sound (Ctrl+R, or switch to video and press the shutter): H.264
-  encoded on the GPU through VA-API, AAC audio, MP4 in `~/Videos/Camera`.
+  (on the GPU through VA-API where there is a driver, else x264), AAC audio,
+  MP4 in `~/Videos/Camera`.
 - Background (menu): Blur (Ctrl+B), the Omarchy wallpaper, or any picture
   behind you. A person matte from Robust Video Matting (15 MB, downloaded
   on first use) keeps you sharp; the result goes into photos, recordings
@@ -79,7 +80,8 @@ sh uninstall.sh
 
 Needs GTK ≥ 4.18, libadwaita ≥ 1.8 and GStreamer with: `gtk4paintablesink`
 (gst-plugin-gtk4), `gleffects` (gst-plugins-base OpenGL), `v4l2src`, `mp4mux`, `pulsesrc` (gst-plugins-good),
-`vah264enc` (gst-plugin-va), `avenc_aac` (gst-libav). `install.sh` checks for
+an H.264 encoder (`vah264enc` from gst-plugin-va on Intel/AMD GPUs,
+else `x264enc` from gst-plugins-ugly), `avenc_aac` (gst-libav). `install.sh` checks for
 all of them and prints the install command for what is missing.
 
 `GAZE_LOG=debug` turns logging up.

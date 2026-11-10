@@ -5,7 +5,7 @@
 //!   tee. ! queue (leaky) ! gtk4paintablesink                 viewfinder + photos
 //!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! capsfilter ! appsink (RGB)
 //!                                                              analysis taps
-//!   tee. ! [recording bin: H.264 (VA-API) + AAC -> MP4]      added while recording
+//!   tee. ! [recording bin: H.264 + AAC -> MP4]              added while recording
 //!   tee. ! [output bin: queue ! videoconvert ! v4l2sink]      added while the virtual camera is on
 //! ```
 //!
@@ -824,7 +824,7 @@ impl Camera {
     }
 
     /// Start recording the camera and a microphone (`None`: the default) to
-    /// `path` (H.264 on the GPU through VA-API, AAC, MP4). A `lapse` above
+    /// `path` (H.264 from [`h264_encoder`], AAC, MP4). A `lapse` above
     /// 1 makes a time-lapse that many times faster, without sound.
     pub fn start_recording(
         &self,
@@ -835,9 +835,12 @@ impl Camera {
         if self.is_recording() {
             return Ok(());
         }
+        let encoder = h264_encoder().ok_or(
+            "no H.264 encoder: install gst-plugin-va (Intel/AMD GPUs) or gst-plugins-ugly (x264)",
+        )?;
         let video = format!(
             "queue name=vq max-size-buffers=0 max-size-bytes=0 max-size-time=2000000000 \
-               ! videoconvert ! vah264enc bitrate=8000 ! h264parse \
+               ! videoconvert ! {encoder} ! h264parse \
                ! mp4mux name=mux ! filesink name=out location=\"{}\"",
             path.display().to_string().replace('"', "\\\"")
         );
@@ -1312,9 +1315,37 @@ fn save_jpeg(sample: &gst::Sample, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot save {}: {e}", path.display()))
 }
 
+/// H.264 encoders the recorder can use, best first, each with the settings
+/// for about 8 Mbit/s: VA-API on Intel/AMD GPUs, a V4L2 hardware encoder on
+/// ARM boards, then x264 and OpenH264 on the CPU (no VA-API driver exists for
+/// some GPUs, Adreno among them, so gst-plugin-va registers nothing there).
+const H264_ENCODERS: &[(&str, &str)] = &[
+    ("vah264enc", "vah264enc bitrate=8000"),
+    (
+        "v4l2h264enc",
+        "v4l2h264enc extra-controls=\"controls,video_bitrate=8000000\"",
+    ),
+    (
+        "x264enc",
+        // 4:2:0, or x264 takes 4:4:4 from RGB sources (High 4:4:4, which
+        // browsers and phones do not play).
+        "video/x-raw,format=I420 ! x264enc bitrate=8000 tune=zerolatency speed-preset=veryfast",
+    ),
+    ("openh264enc", "openh264enc bitrate=8000000"),
+];
+
+/// The first H.264 encoder GStreamer has, as a pipeline fragment.
+fn h264_encoder() -> Option<&'static str> {
+    H264_ENCODERS
+        .iter()
+        .find(|(factory, _)| gst::ElementFactory::find(factory).is_some())
+        .map(|(_, fragment)| *fragment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::str::FromStr;
 
     #[test]
