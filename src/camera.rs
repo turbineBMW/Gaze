@@ -121,6 +121,30 @@ impl Format {
     }
 }
 
+/// The largest size the pipeline asks for by default.
+const DEFAULT_MAX: (i32, i32) = (1920, 1080);
+
+/// What to ask a camera for when no format is chosen: anything up to 1080p
+/// and the driver's pick. A camera that offers nothing that small (an ISP
+/// node that only speaks 4K, say) is asked for its smallest size instead,
+/// or negotiation fails and the picture stays black.
+fn default_caps(formats: &[Format]) -> gst::Caps {
+    let (max_w, max_h) = DEFAULT_MAX;
+    let fits = |f: &Format| f.width <= max_w && f.height <= max_h;
+    if formats.is_empty() || formats.iter().any(fits) {
+        return gst::Caps::builder("video/x-raw")
+            .field("width", gst::IntRange::new(1, max_w))
+            .field("height", gst::IntRange::new(1, max_h))
+            .build();
+    }
+    // Sorted largest first, so the smallest is at the end.
+    let smallest = formats.last().unwrap();
+    gst::Caps::builder("video/x-raw")
+        .field("width", smallest.width)
+        .field("height", smallest.height)
+        .build()
+}
+
 /// The fixed raw formats in a device's caps, deduplicated, largest and
 /// fastest first. Frame-rate lists are expanded; ranges contribute their
 /// top.
@@ -208,6 +232,11 @@ pub fn list() -> Vec<CameraInfo> {
             .unwrap_or_default();
         match (api.as_str(), path) {
             ("v4l2", Some(path)) => {
+                // Raw ISP outputs are not cameras; libcamera's node for the
+                // sensor is listed below.
+                if crate::controls::needs_media_controller(Path::new(&path)) {
+                    continue;
+                }
                 if !seen.contains(&path) {
                     seen.push(path.clone());
                     v4l2.push(CameraInfo {
@@ -482,10 +511,7 @@ impl Camera {
                 }
                 caps.build()
             }
-            None => gst::Caps::builder("video/x-raw")
-                .field("width", gst::IntRange::new(1, 1920))
-                .field("height", gst::IntRange::new(1, 1080))
-                .build(),
+            None => default_caps(&info.formats),
         };
         let filter = make("capsfilter")?;
         filter.set_property("caps", &caps);
@@ -1346,6 +1372,38 @@ fn h264_encoder() -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    fn fmt(width: i32, height: i32) -> Format {
+        Format {
+            width,
+            height,
+            fps: None,
+        }
+    }
+
+    #[test]
+    fn default_caps_keep_the_1080p_ceiling_when_the_camera_fits() {
+        gst::init().unwrap();
+        let caps = default_caps(&[fmt(3840, 2160), fmt(1920, 1080), fmt(640, 480)]);
+        let s = caps.structure(0).unwrap();
+        assert_eq!(s.get::<gst::IntRange<i32>>("width").unwrap().max(), 1920);
+        assert_eq!(s.get::<gst::IntRange<i32>>("height").unwrap().max(), 1080);
+        // No formats known (a loopback nobody feeds yet): same open request.
+        assert_eq!(default_caps(&[]), caps);
+    }
+
+    #[test]
+    fn default_caps_take_the_smallest_size_of_a_camera_above_1080p() {
+        gst::init().unwrap();
+        let caps = default_caps(&[fmt(3840, 2160)]);
+        let s = caps.structure(0).unwrap();
+        assert_eq!(s.get::<i32>("width").unwrap(), 3840);
+        assert_eq!(s.get::<i32>("height").unwrap(), 2160);
+        let caps = default_caps(&[fmt(4096, 2160), fmt(2560, 1440)]);
+        assert_eq!(
+            caps.structure(0).unwrap().get::<i32>("width").unwrap(),
+            2560
+        );
+    }
     use std::str::FromStr;
 
     #[test]

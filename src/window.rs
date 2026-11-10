@@ -1140,6 +1140,7 @@ impl Window {
         let cameras = camera::list();
         self.fill_mics_menu();
         let names: Vec<&str> = cameras.iter().map(|c| c.name.as_str()).collect();
+        log::debug!("cameras: {names:?}");
         let model = gtk::StringList::new(&names);
         let wanted = self.settings.borrow().camera.clone();
         let index = wanted
