@@ -1,11 +1,10 @@
 [Desktop Entry]
-Name=Gaze
-GenericName=Camera
+Name=Camera
 Comment=Take photos and videos with your camera
 Exec=gaze
 Icon=io.github.turbinebmw.Gaze
 Terminal=false
 Type=Application
 Categories=GTK;AudioVideo;Video;Recorder;
-Keywords=Camera;Webcam;Photo;Video;Selfie;Record;
+Keywords=Gaze;Webcam;Photo;Video;Selfie;Record;
 StartupNotify=true
