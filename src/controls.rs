@@ -137,13 +137,29 @@ fn c_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// The device's driver name, e.g. "uvcvideo" or "v4l2 loopback".
-pub fn driver(device: &Path) -> Option<String> {
+fn query_capability(device: &Path) -> Option<Capability> {
     let fd = open(device).ok()?;
     // SAFETY: Capability is what VIDIOC_QUERYCAP fills.
     let mut cap: Capability = unsafe { std::mem::zeroed() };
     unsafe { call(&fd, VIDIOC_QUERYCAP, &mut cap) }.ok()?;
-    Some(c_string(&cap.driver))
+    Some(cap)
+}
+
+/// The device's driver name, e.g. "uvcvideo" or "v4l2 loopback".
+pub fn driver(device: &Path) -> Option<String> {
+    Some(c_string(&query_capability(device)?.driver))
+}
+
+/// V4L2_CAP_IO_MC: the node streams only once the media controller has
+/// routed a pipeline to it.
+const CAP_IO_MC: u32 = 0x2000_0000;
+
+/// Whether the node is a fragment of a complex camera (a raw ISP output,
+/// as the Qualcomm and Intel IPU drivers expose by the dozen) rather than a
+/// camera in itself. libcamera drives those and publishes the result as a
+/// camera of its own; plain webcams and loopback devices never set the flag.
+pub fn needs_media_controller(device: &Path) -> bool {
+    query_capability(device).is_some_and(|cap| cap.device_caps & CAP_IO_MC != 0)
 }
 
 /// The adjustable controls, in the driver's order. Loopback devices'
