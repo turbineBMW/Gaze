@@ -80,15 +80,18 @@ struct Ui {
     read_text: gtk::ToggleButton,
     stats_labels: Vec<gtk::Label>,
     swatch: gtk::DrawingArea,
-    cameras_dropdown: gtk::DropDown,
+    /// Two cameras: one button flips between them. More: a picker.
+    camera_switch: gtk::Button,
+    camera_picker: gtk::MenuButton,
+    camera_list: gtk::Box,
     shutter: gtk::Button,
     mode_toggle: adw::ToggleGroup,
     timer: gtk::Label,
     flash: gtk::Box,
-    controls: gtk::CenterBox,
+    /// The bar down the right edge that holds every control.
+    rail: gtk::WindowHandle,
     /// Leaves compact mode; only shown in it.
     expand: gtk::Button,
-    toolbar: adw::ToolbarView,
     /// The Format submenu, refilled for each camera.
     formats_menu: gio::Menu,
     /// The Microphone submenu, refilled with the cameras.
@@ -182,7 +185,8 @@ pub struct Window {
     swatch_rgb: Cell<[f64; 3]>,
     /// Set while the camera list is rebuilt, so the dropdown's selection
     /// changes don't open cameras on the way.
-    rebuilding: Cell<bool>,
+    /// The open camera's index in `cameras`.
+    selected: Cell<usize>,
 }
 
 impl Window {
@@ -245,7 +249,7 @@ impl Window {
             drag_start: Cell::new(None),
             recording_since: Cell::new(None),
             swatch_rgb: Cell::new([0.0; 3]),
-            rebuilding: Cell::new(false),
+            selected: Cell::new(0),
         });
         this.connect();
         this.install_actions(app);
@@ -353,26 +357,6 @@ impl Window {
                         action.set_state(&mode.name().to_variant());
                     }
                 }
-            }
-        ));
-        ui.cameras_dropdown.connect_selected_notify(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            move |dropdown| {
-                if this.rebuilding.get() {
-                    return;
-                }
-                let index = dropdown.selected() as usize;
-                let name = this.cameras.borrow().get(index).map(|c| c.name.clone());
-                if let Some(name) = name {
-                    if this.settings.borrow().camera.as_deref() != Some(name.as_str()) {
-                        this.settings.borrow_mut().camera = Some(name);
-                        this.settings.borrow().save();
-                        this.mirror.set(this.default_mirror());
-                        this.apply_mirror();
-                    }
-                }
-                this.open_selected();
             }
         ));
 
@@ -790,6 +774,40 @@ impl Window {
         ));
         window.add_action(&wallpaper);
 
+        // Cameras: by name (the picker, `gaze --do camera NAME`), or the next.
+        let camera = gio::SimpleAction::new_stateful(
+            "camera",
+            Some(glib::VariantTy::STRING),
+            &String::new().to_variant(),
+        );
+        camera.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, value| {
+                let Some(name) = value.and_then(|v| v.str()) else {
+                    return;
+                };
+                let index = this.cameras.borrow().iter().position(|c| c.name == name);
+                if let Some(index) = index {
+                    this.select_camera(index);
+                }
+            }
+        ));
+        window.add_action(&camera);
+        let next_camera = gio::SimpleAction::new("next-camera", None);
+        next_camera.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                let count = this.cameras.borrow().len();
+                if count > 1 {
+                    this.select_camera((this.selected.get() + 1) % count);
+                }
+            }
+        ));
+        window.add_action(&next_camera);
+        app.set_accels_for_action("win.next-camera", &["<Control>Tab"]);
+
         // Compact: a small, always-on-top mirror in the corner.
         let compact = gio::SimpleAction::new_stateful("compact", None, &false.to_variant());
         compact.connect_activate(glib::clone!(
@@ -1073,20 +1091,14 @@ impl Window {
         ));
         window.add_action(&fullscreen);
         app.set_accels_for_action("win.fullscreen", &["F11"]);
-        // The header bar goes with the window chrome.
-        window.connect_fullscreened_notify(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            move |window| {
-                let full = window.is_fullscreen();
-                this.ui.toolbar.set_reveal_top_bars(!full);
-                if let Some(action) = window.lookup_action("fullscreen") {
-                    if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
-                        action.set_state(&full.to_variant());
-                    }
+        window.connect_fullscreened_notify(|window| {
+            let full = window.is_fullscreen();
+            if let Some(action) = window.lookup_action("fullscreen") {
+                if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                    action.set_state(&full.to_variant());
                 }
             }
-        ));
+        });
 
         for (name, dir) in [("open-photos", photos_dir()), ("open-videos", videos_dir())] {
             let action = gio::SimpleAction::new(name, None);
@@ -1139,28 +1151,93 @@ impl Window {
         }
         let cameras = camera::list();
         self.fill_mics_menu();
-        let names: Vec<&str> = cameras.iter().map(|c| c.name.as_str()).collect();
-        let model = gtk::StringList::new(&names);
+        log::debug!(
+            "cameras: {:?}",
+            cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+        );
         let wanted = self.settings.borrow().camera.clone();
         let index = wanted
             .and_then(|w| cameras.iter().position(|c| c.name == w))
             .unwrap_or(0);
         let empty = cameras.is_empty();
         self.cameras.replace(cameras);
+        self.selected.set(index);
+        self.fill_camera_picker();
         if empty {
             self.show_status(
                 "No Camera Found",
                 "Connect a camera, then choose Refresh Cameras.",
             );
-            self.rebuilding.set(true);
-            self.ui.cameras_dropdown.set_model(Some(&model));
-            self.rebuilding.set(false);
             return;
         }
-        self.rebuilding.set(true);
-        self.ui.cameras_dropdown.set_model(Some(&model));
-        self.ui.cameras_dropdown.set_selected(index as u32);
-        self.rebuilding.set(false);
+        self.open_selected();
+    }
+
+    /// The camera control on the rail: hidden for one camera, a flip
+    /// button for two, a picker for more.
+    fn fill_camera_picker(&self) {
+        let cameras = self.cameras.borrow();
+        let ui = &self.ui;
+        ui.camera_switch.set_visible(cameras.len() == 2);
+        ui.camera_picker.set_visible(cameras.len() > 2);
+        while let Some(child) = ui.camera_list.first_child() {
+            ui.camera_list.remove(&child);
+        }
+        for camera in cameras.iter() {
+            let label = gtk::Label::builder()
+                .label(&camera.name)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(36)
+                .build();
+            let button = gtk::ToggleButton::builder()
+                .child(&label)
+                .action_name("win.camera")
+                .action_target(&camera.name.to_variant())
+                .build();
+            button.add_css_class("flat");
+            ui.camera_list.append(&button);
+        }
+        let current = cameras.get(self.selected.get());
+        if let Some(info) = current {
+            ui.camera_switch
+                .set_tooltip_text(Some(&format!("Switch Camera (now {})", info.name)));
+        }
+        if let Some(action) = ui.window.lookup_action("camera") {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                let name = current.map(|c| c.name.clone()).unwrap_or_default();
+                action.set_state(&name.to_variant());
+            }
+        }
+    }
+
+    /// Switch to another camera, remembering the choice.
+    fn select_camera(self: &Rc<Self>, index: usize) {
+        let name = self.cameras.borrow().get(index).map(|c| c.name.clone());
+        let Some(name) = name else {
+            return;
+        };
+        if index == self.selected.get() && self.camera.borrow().is_some() {
+            return;
+        }
+        if self.counting_down()
+            || self
+                .camera
+                .borrow()
+                .as_ref()
+                .is_some_and(Camera::is_recording)
+        {
+            return;
+        }
+        self.selected.set(index);
+        self.fill_camera_picker();
+        if self.settings.borrow().camera.as_deref() != Some(name.as_str()) {
+            self.settings.borrow_mut().camera = Some(name);
+            self.settings.borrow().save();
+            self.mirror.set(self.default_mirror());
+            self.apply_mirror();
+        }
+        self.ui.camera_picker.popdown();
         self.open_selected();
     }
 
@@ -1177,7 +1254,7 @@ impl Window {
         if let Some(camera) = self.camera.take() {
             camera.close();
         }
-        let index = self.ui.cameras_dropdown.selected() as usize;
+        let index = self.selected.get();
         let cameras = self.cameras.borrow();
         let Some(info) = cameras.get(index) else {
             return;
@@ -1399,7 +1476,7 @@ impl Window {
     }
 
     fn current_camera_name(&self) -> Option<String> {
-        let index = self.ui.cameras_dropdown.selected() as usize;
+        let index = self.selected.get();
         self.cameras.borrow().get(index).map(|c| c.name.clone())
     }
 
@@ -1425,7 +1502,7 @@ impl Window {
     }
 
     fn default_mirror(&self) -> bool {
-        let index = self.ui.cameras_dropdown.selected() as usize;
+        let index = self.selected.get();
         self.cameras.borrow().get(index).is_some_and(|c| {
             !c.name.to_lowercase().contains("rear") && !c.name.to_lowercase().contains("back")
         })
@@ -1961,9 +2038,7 @@ impl Window {
             }
         }
         let ui = &self.ui;
-        ui.toolbar
-            .set_reveal_top_bars(!on && !ui.window.is_fullscreen());
-        ui.controls.set_visible(!on);
+        ui.rail.set_visible(!on);
         ui.expand.set_visible(on);
         if on {
             ui.stats_card.set_visible(false);
@@ -2033,33 +2108,41 @@ impl Window {
         });
     }
 
+    /// Feed the effect thumbnails; the pipeline is built on first use and
+    /// kept until the camera changes.
     fn start_previews(&self) {
-        if self.previews.borrow().is_some() {
-            return;
-        }
         let camera = self.camera.borrow();
         let Some(camera) = camera.as_ref() else {
             return;
         };
+        let mut previews = self.previews.borrow_mut();
+        if let Some(previews) = previews.as_mut() {
+            previews.resume(camera);
+            return;
+        }
         match Previews::start(camera, self.thumb_sender.clone()) {
-            Ok(previews) => {
-                self.previews.replace(Some(previews));
-            }
+            Ok(started) => *previews = Some(started),
             Err(error) => log::warn!("effect previews: {error}"),
         }
     }
 
     fn stop_previews(&self) {
-        if let Some(previews) = self.previews.take() {
-            if let Some(camera) = self.camera.borrow().as_ref() {
-                previews.stop(camera);
-            }
+        if let (Some(previews), Some(camera)) = (
+            self.previews.borrow_mut().as_mut(),
+            self.camera.borrow().as_ref(),
+        ) {
+            previews.pause(camera);
         }
     }
 
     /// A thumbnail from the previews: onto its tile.
     fn on_thumb(&self, id: &'static str, frame: camera::Frame) {
-        if self.previews.borrow().is_none() {
+        if !self
+            .previews
+            .borrow()
+            .as_ref()
+            .is_some_and(Previews::is_live)
+        {
             return;
         }
         let Some((_, picture)) = self.ui.effect_pictures.iter().find(|(i, _)| *i == id) else {
@@ -2621,9 +2704,13 @@ impl Window {
             self.ui.pause_button.set_active(false);
         }
         self.ui.mode_toggle.set_sensitive(!recording && !counting);
-        self.ui
-            .cameras_dropdown
-            .set_sensitive(!recording && !counting);
+        for name in ["camera", "next-camera"] {
+            if let Some(action) = self.ui.window.lookup_action(name) {
+                if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                    action.set_enabled(!recording && !counting);
+                }
+            }
+        }
         if !recording {
             self.ui.timer.set_label("00:00");
         }
@@ -2754,7 +2841,6 @@ impl Window {
 }
 
 fn build_ui(app: &adw::Application) -> Ui {
-    let cameras_dropdown = gtk::DropDown::builder().tooltip_text("Camera").build();
     let menu = gio::Menu::new();
     let formats_menu = gio::Menu::new();
     let picture_menu = gio::Menu::new();
@@ -2808,16 +2894,9 @@ fn build_ui(app: &adw::Application) -> Ui {
     let about = gio::Menu::new();
     about.append(Some("About Gaze"), Some("win.about"));
     menu.append_section(None, &about);
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .menu_model(&menu)
-        .primary(true)
-        .tooltip_text("Main Menu")
-        .build();
-    let header = adw::HeaderBar::builder()
-        .title_widget(&cameras_dropdown)
-        .build();
-    header.pack_end(&menu_button);
+    let menu_button = rail_menu_button("open-menu-symbolic", "Main Menu");
+    menu_button.set_menu_model(Some(&menu));
+    menu_button.set_primary(true);
 
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
@@ -2875,7 +2954,7 @@ fn build_ui(app: &adw::Application) -> Ui {
         .halign(gtk::Align::End)
         .valign(gtk::Align::Start)
         .margin_top(12)
-        .margin_end(12)
+        .margin_end(RAIL_WIDTH + 12)
         .visible(false)
         .can_target(false)
         .build();
@@ -2989,8 +3068,12 @@ fn build_ui(app: &adw::Application) -> Ui {
     text_card.append(&text_title);
     text_card.append(&text_buttons);
 
-    // Controls
-    let mode_toggle = adw::ToggleGroup::new();
+    // The rail: every control in one translucent bar down the right edge,
+    // sized for fingers. Popovers open to its left.
+    let mode_toggle = adw::ToggleGroup::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .build();
     mode_toggle.add(
         adw::Toggle::builder()
             .name("photo")
@@ -3013,8 +3096,31 @@ fn build_ui(app: &adw::Application) -> Ui {
             .build(),
     );
     mode_toggle.set_active_name(Some("photo"));
-    mode_toggle.add_css_class("osd");
-    mode_toggle.add_css_class("round");
+    mode_toggle.add_css_class("flat");
+    mode_toggle.add_css_class("modes");
+
+    // Cameras: a flip button for two, a picker for more.
+    let camera_switch = gtk::Button::builder()
+        .icon_name("camera-switch-symbolic")
+        .action_name("win.next-camera")
+        .tooltip_text("Switch Camera")
+        .halign(gtk::Align::Center)
+        .css_classes(["rail-button"])
+        .visible(false)
+        .build();
+    let camera_list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let camera_popover = rail_popover(&camera_list);
+    camera_popover.add_css_class("cameras");
+    let camera_picker = rail_menu_button("camera-web-symbolic", "Camera");
+    camera_picker.set_popover(Some(&camera_popover));
+    camera_picker.set_visible(false);
 
     // Self-timer picker: a radio menu over win.timer.
     let timer_menu = gio::Menu::new();
@@ -3029,18 +3135,18 @@ fn build_ui(app: &adw::Application) -> Ui {
     }
     let timer_label = gtk::Label::builder().label("0 s").visible(false).build();
     timer_label.add_css_class("numeric");
-    let timer_content = gtk::Box::builder().spacing(6).build();
-    timer_content.append(&gtk::Image::from_icon_name("alarm-symbolic"));
-    timer_content.append(&timer_label);
-    let timer_button = gtk::MenuButton::builder()
-        .child(&timer_content)
-        .menu_model(&timer_menu)
-        .tooltip_text("Self-Timer")
+    timer_label.add_css_class("timer-secs");
+    let timer_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .build();
-    timer_button.add_css_class("osd");
-    timer_button.add_css_class("pill");
-    timer_button.add_css_class("self-timer");
+    timer_content.append(&gtk::Image::from_icon_name("alarm-symbolic"));
+    timer_content.append(&timer_label);
+    let timer_button = rail_menu_button("alarm-symbolic", "Self-Timer");
+    timer_button.set_child(Some(&timer_content));
+    timer_button.set_menu_model(Some(&timer_menu));
+
     let inner = gtk::Box::builder()
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
@@ -3056,23 +3162,9 @@ fn build_ui(app: &adw::Application) -> Ui {
     shutter.add_css_class("photo");
     let timer = gtk::Label::builder().label("00:00").visible(false).build();
     timer.add_css_class("timer");
-    timer.add_css_class("osd");
     timer.add_css_class("numeric");
-    let controls = gtk::CenterBox::builder()
-        .valign(gtk::Align::End)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
-        .build();
-    let left = gtk::Box::builder()
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::Center)
-        .spacing(10)
-        .build();
-    left.append(&mode_toggle);
-    left.append(&timer_button);
+
     let (effects_button, effect_pictures) = effects_button();
-    left.append(&effects_button);
     let controls_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -3082,37 +3174,27 @@ fn build_ui(app: &adw::Application) -> Ui {
         .margin_end(10)
         .width_request(380)
         .build();
-    let controls_popover = gtk::Popover::builder().child(&controls_box).build();
-    let controls_button = gtk::MenuButton::builder()
-        .icon_name("emblem-system-symbolic")
-        .popover(&controls_popover)
-        .tooltip_text("Camera Controls")
-        .valign(gtk::Align::Center)
-        .build();
-    controls_button.add_css_class("osd");
-    controls_button.add_css_class("circular");
-    left.append(&controls_button);
-    controls.set_start_widget(Some(&left));
-    controls.set_center_widget(Some(&shutter));
+    let controls_popover = rail_popover(&controls_box);
+    let controls_button = rail_menu_button("emblem-system-symbolic", "Camera Controls");
+    controls_button.set_popover(Some(&controls_popover));
     let scan_button = gtk::ToggleButton::builder()
         .icon_name("scanner-symbolic")
         .action_name("win.scan")
         .tooltip_text("Scan Codes")
-        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .css_classes(["rail-button"])
         .build();
-    scan_button.add_css_class("osd");
-    scan_button.add_css_class("circular");
     // Last capture: a thumbnail that opens the session's gallery.
     // A picture wants its texture's size; allocating it as an overlay over
-    // a fixed 44 px box, clipped, keeps the button small whatever it shows.
+    // a fixed box, clipped, keeps the button small whatever it shows.
     let thumb_picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
         .build();
     let thumb_frame = gtk::Overlay::builder()
         .child(
             &gtk::Box::builder()
-                .width_request(44)
-                .height_request(44)
+                .width_request(32)
+                .height_request(32)
                 .build(),
         )
         .overflow(gtk::Overflow::Hidden)
@@ -3159,44 +3241,37 @@ fn build_ui(app: &adw::Application) -> Ui {
         .build();
     gallery_box.append(&gallery_scroller);
     gallery_box.append(&gallery_buttons);
-    let gallery_popover = gtk::Popover::builder().child(&gallery_box).build();
+    let gallery_popover = rail_popover(&gallery_box);
     let thumb_button = gtk::MenuButton::builder()
         .child(&thumb_frame)
         .popover(&gallery_popover)
         .tooltip_text("Last Photo")
-        .valign(gtk::Align::Center)
+        .direction(gtk::ArrowType::Left)
+        .halign(gtk::Align::Center)
         .visible(false)
         .build();
-    thumb_button.add_css_class("osd");
     thumb_button.add_css_class("thumb");
 
-    let right = gtk::Box::builder()
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Center)
-        .spacing(10)
-        .build();
     let read_text = gtk::ToggleButton::builder()
         .icon_name("font-x-generic-symbolic")
         .tooltip_text("Read Text")
-        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .css_classes(["rail-button"])
         .build();
-    read_text.add_css_class("osd");
-    read_text.add_css_class("circular");
     read_text.set_action_name(Some("win.read-text"));
     let pause_button = gtk::ToggleButton::builder()
         .icon_name("media-playback-pause-symbolic")
         .tooltip_text("Pause Recording")
         .action_name("win.pause")
-        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .css_classes(["rail-button"])
         .visible(false)
         .build();
-    pause_button.add_css_class("osd");
-    pause_button.add_css_class("circular");
     let level = gtk::LevelBar::builder()
         .min_value(0.0)
         .max_value(1.0)
-        .width_request(72)
-        .valign(gtk::Align::Center)
+        .width_request(36)
+        .halign(gtk::Align::Center)
         .visible(false)
         .tooltip_text("Microphone level")
         .build();
@@ -3204,13 +3279,72 @@ fn build_ui(app: &adw::Application) -> Ui {
     level.add_offset_value(gtk::LEVEL_BAR_OFFSET_HIGH, 0.85);
     level.add_offset_value(gtk::LEVEL_BAR_OFFSET_FULL, 0.97);
     level.add_css_class("mic-level");
-    right.append(&level);
-    right.append(&pause_button);
-    right.append(&timer);
-    right.append(&thumb_button);
-    right.append(&read_text);
-    right.append(&scan_button);
-    controls.set_end_widget(Some(&right));
+
+    let column = || {
+        gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .halign(gtk::Align::Center)
+            .spacing(6)
+            .build()
+    };
+    let top = column();
+    // Window buttons, where the desktop wants them (not on Hyprland).
+    if !crate::hypr::available() {
+        let window_controls = gtk::WindowControls::builder()
+            .side(gtk::PackType::End)
+            .halign(gtk::Align::Center)
+            .build();
+        top.append(&window_controls);
+    }
+    top.append(&menu_button);
+    top.append(&camera_switch);
+    top.append(&camera_picker);
+    top.append(&controls_button);
+    top.append(&effects_button);
+    top.append(&timer_button);
+    let middle = column();
+    middle.set_valign(gtk::Align::Center);
+    middle.append(&mode_toggle);
+    middle.append(&shutter);
+    middle.append(&timer);
+    middle.append(&level);
+    middle.append(&pause_button);
+    let bottom = column();
+    bottom.append(&scan_button);
+    bottom.append(&read_text);
+    bottom.append(&thumb_button);
+    let rail_box = gtk::CenterBox::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .start_widget(&top)
+        .center_widget(&middle)
+        .end_widget(&bottom)
+        .build();
+    // Short windows scroll the rail rather than squash it.
+    let rail_scroller = gtk::ScrolledWindow::builder()
+        .child(&rail_box)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::External)
+        .propagate_natural_width(true)
+        .build();
+    // A handle, so the rail also moves the window, as a title bar would.
+    let rail = gtk::WindowHandle::builder()
+        .child(&rail_scroller)
+        .halign(gtk::Align::End)
+        .width_request(RAIL_WIDTH)
+        .build();
+    rail.add_css_class("rail");
+    for button in [
+        &menu_button,
+        &camera_picker,
+        &controls_button,
+        &effects_button,
+        &timer_button,
+        &thumb_button,
+    ] {
+        if let Some(popover) = button.popover() {
+            fit_popover(&popover, rail.upcast_ref());
+        }
+    }
 
     let overlay = gtk::Overlay::builder().child(&picture).build();
     overlay.add_css_class("viewfinder-frame");
@@ -3221,7 +3355,6 @@ fn build_ui(app: &adw::Application) -> Ui {
     overlay.add_overlay(&text_layer);
     overlay.add_overlay(&code_card);
     overlay.add_overlay(&text_card);
-    overlay.add_overlay(&controls);
     let expand = gtk::Button::builder()
         .icon_name("view-restore-symbolic")
         .action_name("win.compact")
@@ -3245,16 +3378,18 @@ fn build_ui(app: &adw::Application) -> Ui {
     stack.add_named(&status, Some("status"));
     stack.set_visible_child_name("status");
 
+    // The rail floats over both the viewfinder and the status page, so the
+    // menu (Refresh Cameras) is there when no camera is.
+    let root = gtk::Overlay::builder().child(&stack).build();
+    root.add_overlay(&rail);
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&stack));
-    let toolbar = adw::ToolbarView::builder().content(&toasts).build();
-    toolbar.add_top_bar(&header);
+    toasts.set_child(Some(&root));
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Gaze")
         .default_width(1100)
         .default_height(720)
-        .content(&toolbar)
+        .content(&toasts)
         .build();
 
     Ui {
@@ -3278,14 +3413,15 @@ fn build_ui(app: &adw::Application) -> Ui {
         read_text,
         stats_labels,
         swatch,
-        cameras_dropdown,
+        camera_switch,
+        camera_picker,
+        camera_list,
         shutter,
         mode_toggle,
         timer,
         flash,
-        controls,
+        rail,
         expand,
-        toolbar,
         formats_menu,
         mics_menu,
         pause_button,
@@ -3450,17 +3586,113 @@ fn effects_button() -> (gtk::MenuButton, Vec<(&'static str, gtk::Picture)>) {
         }
         content.append(&grid);
     }
-    let popover = gtk::Popover::builder().child(&content).build();
+    let popover = rail_popover(&content);
     popover.add_css_class("effects");
-    let button = gtk::MenuButton::builder()
-        .icon_name("color-select-symbolic")
-        .popover(&popover)
-        .tooltip_text("Effects")
-        .valign(gtk::Align::Center)
-        .build();
-    button.add_css_class("osd");
-    button.add_css_class("circular");
+    let button = rail_menu_button("color-select-symbolic", "Effects");
+    button.set_popover(Some(&popover));
     (button, pictures)
+}
+
+/// The rail's width: the shutter and a little padding.
+const RAIL_WIDTH: i32 = 64;
+
+/// The space between a popover and the rail, and the window's edges.
+const POPOVER_GAP: i32 = 10;
+
+/// A popover whose content scrolls once the window is too short for it
+/// (see [`fit_popover`]).
+fn rail_popover(child: &impl IsA<gtk::Widget>) -> gtk::Popover {
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(child)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .build();
+    gtk::Popover::builder().child(&scroller).build()
+}
+
+/// The first scrolled window in a widget tree, outermost first: ours in a
+/// [`rail_popover`], the one a `gtk::PopoverMenu` keeps inside it.
+fn find_scroller(widget: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
+    if let Some(scroller) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+        return Some(scroller.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = find_scroller(&widget) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+/// Keep a rail popover inside the window: GTK only keeps popups on the
+/// monitor. Each time it opens, its content is capped to the window's
+/// height (scrolling past that), and it is aimed at a point beside the rail
+/// chosen so the whole popover clears the window's top and bottom, a gap
+/// left of the rail.
+fn fit_popover(popover: &gtk::Popover, rail: &gtk::Widget) {
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Left);
+    let rail = rail.downgrade();
+    popover.connect_show(move |popover| {
+        let (Some(rail), Some(button), Some(scroller)) = (
+            rail.upgrade(),
+            popover.parent(),
+            find_scroller(popover.upcast_ref()),
+        ) else {
+            return;
+        };
+        let Some(root) = button.root() else {
+            return;
+        };
+        let window_h = root.height();
+        let room = (window_h - 2 * POPOVER_GAP).max(1);
+        // The popover's own padding and shadow sit around the content.
+        let (_, natural, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
+        let (_, content, _, _) = scroller.measure(gtk::Orientation::Vertical, -1);
+        let chrome = (natural - content).max(0);
+        scroller.set_max_content_height((room - chrome).max(1));
+        let height = natural.min(room);
+        let (Some(bounds), Some(rail_bounds)) =
+            (button.compute_bounds(&root), rail.compute_bounds(&button))
+        else {
+            return;
+        };
+        let centre = bounds.y() + bounds.height() / 2.0;
+        let half = height as f32 / 2.0;
+        let (low, high) = (
+            POPOVER_GAP as f32 + half,
+            window_h as f32 - POPOVER_GAP as f32 - half,
+        );
+        let centre = if low <= high {
+            centre.clamp(low, high)
+        } else {
+            window_h as f32 / 2.0
+        };
+        // Aim at the rail's left edge, at that height, in the button's
+        // coordinates.
+        let y = (centre - bounds.y()).round() as i32;
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(
+            rail_bounds.x().round() as i32,
+            y,
+            1,
+            1,
+        )));
+        popover.set_offset(-POPOVER_GAP, 0);
+    });
+}
+
+/// A rail button that opens a popover or menu to its left.
+fn rail_menu_button(icon: &str, tooltip: &str) -> gtk::MenuButton {
+    gtk::MenuButton::builder()
+        .icon_name(icon)
+        .tooltip_text(tooltip)
+        .direction(gtk::ArrowType::Left)
+        .halign(gtk::Align::Center)
+        .css_classes(["rail-button"])
+        .build()
 }
 
 /// Menu radio state for a backdrop setting.
