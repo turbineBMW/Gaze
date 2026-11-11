@@ -1,7 +1,8 @@
 //! Cameras and the GStreamer pipeline behind the viewfinder.
 //!
 //! ```text
-//! source ! capsfilter (raw, system memory, <= 1080p) ! effect ! background ! tee
+//! source [! capsfilter (image/jpeg) ! jpegdec] ! capsfilter (raw, system memory, <= 1080p)
+//!   ! effect ! background ! tee
 //!   tee. ! queue (leaky) ! gtk4paintablesink                 viewfinder + photos
 //!   tee. ! valve ! queue ! videorate ! videoconvert ! videoscale ! capsfilter ! appsink (RGB)
 //!                                                              analysis taps
@@ -28,6 +29,11 @@
 //! honouring the stream's colorimetry (the hardware-ISP relay sends
 //! limited-range video; decoding it as full range is what makes Snapshot's
 //! picture grey).
+//!
+//! USB webcams send raw video only as fast as USB 2 carries it (1080p YUYV
+//! at 5 fps is common) and the fast modes as MJPEG, which Chromium picks.
+//! When the largest raw size is that slow, the automatic format is the
+//! largest one that runs at 24 fps or more, MJPEG decoded by `jpegdec`.
 
 use gst::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -37,7 +43,8 @@ use std::sync::{Arc, Mutex};
 pub struct CameraInfo {
     pub name: String,
     source: Source,
-    /// The raw formats the camera offers, largest and fastest first.
+    /// The formats the camera offers (raw, or MJPEG where raw cannot do
+    /// that size and rate), largest and fastest first.
     pub formats: Vec<Format>,
 }
 
@@ -57,12 +64,22 @@ pub struct Format {
     pub width: i32,
     pub height: i32,
     pub fps: Option<gst::Fraction>,
+    /// Sent as MJPEG and decoded in the pipeline.
+    pub mjpeg: bool,
 }
 
+/// The id prefix of an MJPEG format.
+const MJPEG_ID: &str = "mjpeg:";
+
+/// The slowest frame rate the automatic format accepts as smooth.
+const SMOOTH_FPS: f64 = 24.0;
+
 impl Format {
-    /// A stable id for menus and the settings file: `1920x1080@30/1`.
+    /// A stable id for menus and the settings file: `1920x1080@30/1`, or
+    /// `mjpeg:1920x1080@30/1`.
     pub fn id(&self) -> String {
-        match self.fps {
+        let prefix = if self.mjpeg { MJPEG_ID } else { "" };
+        let id = match self.fps {
             Some(fps) => format!(
                 "{}x{}@{}/{}",
                 self.width,
@@ -71,10 +88,15 @@ impl Format {
                 fps.denom()
             ),
             None => format!("{}x{}", self.width, self.height),
-        }
+        };
+        format!("{prefix}{id}")
     }
 
     pub fn parse(id: &str) -> Option<Format> {
+        let (mjpeg, id) = match id.strip_prefix(MJPEG_ID) {
+            Some(rest) => (true, rest),
+            None => (false, id),
+        };
         let (size, fps) = match id.split_once('@') {
             Some((size, fps)) => (size, Some(fps)),
             None => (id, None),
@@ -91,7 +113,24 @@ impl Format {
             width: w.parse().ok()?,
             height: h.parse().ok()?,
             fps,
+            mjpeg,
         })
+    }
+
+    /// The caps to ask the source for.
+    fn caps(&self) -> gst::Caps {
+        let name = if self.mjpeg {
+            "image/jpeg"
+        } else {
+            "video/x-raw"
+        };
+        let mut caps = gst::Caps::builder(name)
+            .field("width", self.width)
+            .field("height", self.height);
+        if let Some(fps) = self.fps {
+            caps = caps.field("framerate", fps);
+        }
+        caps.build()
     }
 
     /// For people: `1920 × 1080 · 30 fps`.
@@ -145,6 +184,36 @@ fn default_caps(formats: &[Format]) -> gst::Caps {
         .build()
 }
 
+/// The format to open a camera with when none is chosen, or `None` for
+/// [`default_caps`] and the driver's pick. That pick is the largest raw size
+/// up to 1080p at whatever rate it runs; when that is slower than
+/// [`SMOOTH_FPS`] (raw video squeezed through USB 2), take the largest size
+/// that is smooth, at its slowest smooth rate, raw or MJPEG.
+fn default_format(formats: &[Format]) -> Option<Format> {
+    let (max_w, max_h) = DEFAULT_MAX;
+    let fitting: Vec<&Format> = formats
+        .iter()
+        .filter(|f| f.width <= max_w && f.height <= max_h)
+        .collect();
+    let largest_raw = fitting.iter().find(|f| !f.mjpeg)?;
+    if largest_raw.fps.is_none() || largest_raw.rate() >= SMOOTH_FPS {
+        return None;
+    }
+    let smooth = |f: &&&Format| f.rate() >= SMOOTH_FPS;
+    let largest = fitting.iter().find(smooth)?;
+    fitting
+        .iter()
+        .filter(smooth)
+        .filter(|f| f.pixels() == largest.pixels())
+        .min_by(|a, b| {
+            a.rate()
+                .partial_cmp(&b.rate())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.mjpeg.cmp(&b.mjpeg))
+        })
+        .map(|f| (*f).clone())
+}
+
 /// Whether a pixel aspect ratio is one no camera has. `pipewiresrc` (1.6.10)
 /// hands out 1/2147483647 when the node advertises none, and `videoscale`
 /// then fails with "integer overflow" in the analysis branch.
@@ -185,15 +254,19 @@ fn square_pixels_if_absurd(pad: &gst::Pad) {
     });
 }
 
-/// The fixed raw formats in a device's caps, deduplicated, largest and
-/// fastest first. Frame-rate lists are expanded; ranges contribute their
-/// top.
+/// The fixed raw and MJPEG formats in a device's caps, deduplicated,
+/// largest and fastest first. Frame-rate lists are expanded; ranges
+/// contribute their top. An MJPEG size and rate the camera also sends raw
+/// is left out: raw needs no decoding.
 fn formats_from_caps(caps: &gst::Caps) -> Vec<Format> {
     let mut formats: Vec<Format> = Vec::new();
-    for structure in caps.iter() {
-        if structure.name() != "video/x-raw" {
-            continue;
-        }
+    // Raw first, so the MJPEG duplicates are seen second.
+    let structures = caps
+        .iter()
+        .filter(|s| s.name() == "video/x-raw")
+        .chain(caps.iter().filter(|s| s.name() == "image/jpeg"));
+    for structure in structures {
+        let mjpeg = structure.name() == "image/jpeg";
         let (Ok(width), Ok(height)) = (
             structure.get::<i32>("width"),
             structure.get::<i32>("height"),
@@ -214,8 +287,14 @@ fn formats_from_caps(caps: &gst::Caps) -> Vec<Format> {
             rates.push(None);
         }
         for fps in rates {
-            let format = Format { width, height, fps };
-            if !formats.contains(&format) {
+            let format = Format {
+                width,
+                height,
+                fps,
+                mjpeg,
+            };
+            let same = |f: &Format| f.width == width && f.height == height && f.fps == fps;
+            if !formats.iter().any(same) {
                 formats.push(format);
             }
         }
@@ -539,19 +618,29 @@ impl Camera {
                 .create_element(Some("source"))
                 .map_err(|e| format!("cannot open {}: {e}", info.name))?,
         };
-        // A chosen format exactly; otherwise anything up to 1080p and the
-        // driver's pick.
-        let caps = match format {
-            Some(f) => {
-                let mut caps = gst::Caps::builder("video/x-raw")
-                    .field("width", f.width)
-                    .field("height", f.height);
-                if let Some(fps) = f.fps {
-                    caps = caps.field("framerate", fps);
-                }
-                caps.build()
+        // A chosen format exactly; otherwise a smooth one when the driver's
+        // pick would crawl, or anything up to 1080p and the driver's pick.
+        let chosen = format.cloned().or_else(|| {
+            let format = default_format(&info.formats);
+            if let Some(format) = &format {
+                log::info!("{}: automatic format {}", info.name, format.id());
             }
-            None => default_caps(&info.formats),
+            format
+        });
+        let (caps, mjpeg) = match &chosen {
+            Some(f) if f.mjpeg => (gst::Caps::new_empty_simple("video/x-raw"), Some(f.caps())),
+            Some(f) => (f.caps(), None),
+            None => (default_caps(&info.formats), None),
+        };
+        // MJPEG: source ! capsfilter (image/jpeg) ! jpegdec, then the raw
+        // capsfilter as for any camera.
+        let decode = match mjpeg {
+            Some(jpeg_caps) => {
+                let jpeg_filter = make("capsfilter")?;
+                jpeg_filter.set_property("caps", &jpeg_caps);
+                vec![jpeg_filter, make("jpegdec")?]
+            }
+            None => Vec::new(),
         };
         if let Some(pad) = source.static_pad("src") {
             square_pixels_if_absurd(&pad);
@@ -639,8 +728,12 @@ impl Camera {
             tap_sink.upcast_ref(),
         ];
         pipeline.add_many(elements).map_err(|e| e.to_string())?;
-        gst::Element::link_many([&source, &filter, &effect, &background, &tee])
-            .map_err(|e| e.to_string())?;
+        pipeline.add_many(&decode).map_err(|e| e.to_string())?;
+        let head =
+            std::iter::once(&source)
+                .chain(&decode)
+                .chain([&filter, &effect, &background, &tee]);
+        gst::Element::link_many(head).map_err(|e| e.to_string())?;
         gst::Element::link_many([&tee, &preview_queue, &preview]).map_err(|e| e.to_string())?;
         gst::Element::link_many([
             &tee,
@@ -1439,7 +1532,49 @@ mod tests {
             width,
             height,
             fps: None,
+            mjpeg: false,
         }
+    }
+
+    fn at(width: i32, height: i32, fps: i32, mjpeg: bool) -> Format {
+        Format {
+            width,
+            height,
+            fps: Some(gst::Fraction::new(fps, 1)),
+            mjpeg,
+        }
+    }
+
+    #[test]
+    fn default_format_leaves_smooth_raw_to_the_driver() {
+        gst::init().unwrap();
+        assert_eq!(default_format(&[]), None);
+        assert_eq!(default_format(&[fmt(1920, 1080), fmt(640, 480)]), None);
+        let formats = [at(1920, 1080, 30, false), at(1920, 1080, 60, true)];
+        assert_eq!(default_format(&formats), None);
+    }
+
+    #[test]
+    fn default_format_takes_mjpeg_when_raw_crawls() {
+        gst::init().unwrap();
+        // The PA552 webcam, as formats_from_caps sorts it.
+        let formats = [
+            at(2560, 1440, 30, true),
+            at(1920, 1080, 60, true),
+            at(1920, 1080, 30, true),
+            at(1920, 1080, 5, false),
+            at(1280, 720, 60, true),
+            at(1280, 720, 30, true),
+            at(1280, 720, 10, false),
+            at(640, 480, 60, true),
+            at(640, 480, 30, false),
+        ];
+        assert_eq!(default_format(&formats), Some(at(1920, 1080, 30, true)));
+        // Raw only: a smaller size that keeps up.
+        let raw: Vec<Format> = formats.iter().filter(|f| !f.mjpeg).cloned().collect();
+        assert_eq!(default_format(&raw), Some(at(640, 480, 30, false)));
+        // Nothing smooth at all: the driver's pick.
+        assert_eq!(default_format(&raw[..2]), None);
     }
 
     #[test]
@@ -1470,10 +1605,12 @@ mod tests {
 
     #[test]
     fn format_ids_round_trip() {
+        gst::init().unwrap();
         let f = Format {
             width: 1280,
             height: 720,
             fps: Some(gst::Fraction::new(30000, 1001)),
+            mjpeg: false,
         };
         assert_eq!(f.id(), "1280x720@30000/1001");
         assert_eq!(Format::parse(&f.id()), Some(f.clone()));
@@ -1482,6 +1619,10 @@ mod tests {
         assert_eq!(plain.fps, None);
         assert_eq!(plain.label(), "640 × 480");
         assert_eq!(Format::parse("nonsense"), None);
+        let jpeg = at(1920, 1080, 30, true);
+        assert_eq!(jpeg.id(), "mjpeg:1920x1080@30/1");
+        assert_eq!(Format::parse(&jpeg.id()), Some(jpeg.clone()));
+        assert_eq!(jpeg.caps().structure(0).unwrap().name(), "image/jpeg");
     }
 
     #[test]
@@ -1511,17 +1652,20 @@ mod tests {
              video/x-raw, width=1920, height=1080, framerate=30/1; \
              video/x-raw, width=1920, height=1080, framerate=30/1; \
              image/jpeg, width=3840, height=2160, framerate=30/1; \
+             image/jpeg, width=1920, height=1080, framerate={ 30/1, 60/1 }; \
              video/x-raw, width=1280, height=720, framerate=[ 1/1, 60/1 ]",
         )
         .unwrap();
-        let labels: Vec<String> = formats_from_caps(&caps).iter().map(Format::label).collect();
+        let ids: Vec<String> = formats_from_caps(&caps).iter().map(Format::id).collect();
         assert_eq!(
-            labels,
+            ids,
             [
-                "1920 × 1080 · 30 fps",
-                "1280 × 720 · 60 fps",
-                "640 × 480 · 30 fps",
-                "640 × 480 · 15 fps",
+                "mjpeg:3840x2160@30/1",
+                "mjpeg:1920x1080@60/1",
+                "1920x1080@30/1",
+                "1280x720@60/1",
+                "640x480@30/1",
+                "640x480@15/1",
             ]
         );
     }

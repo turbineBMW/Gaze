@@ -70,6 +70,12 @@ docs/ROADMAP.md  the phases: timer, codes, OCR, effects, virtual camera, ...
 - Caps are forced to system-memory raw video so every branch gets the same
   frames; `videoconvert` does YUV -> RGB with the stream's colorimetry, which
   is what keeps photos and stats correct for limited-range cameras.
+- USB webcams over USB 2 send raw YUYV slowly (the PA552: 1080p at 5 fps)
+  and their 30/60 fps modes only as MJPEG. Left to itself, `v4l2src` fixates
+  on the largest raw size whatever its rate, so `default_format` takes the
+  largest format at 24 fps or more when the largest raw one is slower, and
+  MJPEG formats get `capsfilter image/jpeg ! jpegdec` before the raw
+  capsfilter. Format ids for MJPEG start with `mjpeg:`.
 - Recording is a bin added to the running tee: pad offsets of minus the
   current running time start the file at zero; stopping sends EOS down both
   branches and the bin's `message-forward` EOS (`GstBinForwarded`) says the
