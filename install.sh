@@ -71,8 +71,9 @@ for size in 16 24 32 48 64 128 256 512; do
   install -Dm644 "data/icons/hicolor/${size}x${size}/apps/$APP_ID.png" \
     "$SHARE/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
 done
-# The old scalable icon would win over the PNGs for some sizes.
-rm -f "$SHARE/icons/hicolor/scalable/apps/$APP_ID.svg"
+# The scalable icon wraps the full-size art, so launchers that take an SVG over
+# PNGs (Omarchy's does) draw it sharp at any size instead of an upscaled small PNG.
+install -Dm644 "data/icons/hicolor/scalable/apps/$APP_ID.svg" "$SHARE/icons/hicolor/scalable/apps/$APP_ID.svg"
 install -Dm644 "data/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg" "$SHARE/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg"
 gtk-update-icon-cache -q -t -f "$SHARE/icons/hicolor" 2>/dev/null || true
 update-desktop-database -q "$SHARE/applications" 2>/dev/null || true
